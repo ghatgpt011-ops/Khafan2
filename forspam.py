@@ -20,6 +20,7 @@ PORT = int(os.environ.get("PORT", 8080))
 SESSION_FILE = "soroush_session.txt"
 JOBS_FILE = "fonex_jobs.json"
 SIDES_FILE = "fonex_sides.json"
+LIMITED_MODES = {"forward_msg", "spam", "reply_loop"}
 
 app = Flask(__name__)
 
@@ -112,6 +113,19 @@ def parse_peer(raw):
     if s.startswith("@"):
         s = s[1:]
     return int(s) if s.lstrip("-").isdigit() else s
+
+
+def extract_msg_id_from_link(link):
+    s = str(link or "").strip()
+    m = re.search(r"splus\.ir/c/-?\d+/(\d+)", s)
+    if m:
+        return int(m.group(1))
+    m2 = re.search(r"/(\d+)(?:[/?#]|$)", s)
+    if m2:
+        return int(m2.group(1))
+    if s.isdigit():
+        return int(s)
+    return None
 
 
 def run_async(coro):
@@ -218,16 +232,38 @@ async def do_verify_code(code):
 async def refresh_groups():
     global groups
     if not client_ready:
+        await ensure_client(force=False)
+    if not client_ready:
         return
     try:
         dialogs = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=15)
+        if asyncio.iscoroutine(dialogs):
+            dialogs = await dialogs
         items = []
         for d in dialogs:
             if getattr(d, "is_group", False) or getattr(d, "is_channel", False):
-                items.append({"id": str(d.id), "name": d.name or str(d.id)})
+                items.append({"id": str(d.id), "name": getattr(d, "name", None) or getattr(d, "title", None) or str(d.id)})
         groups[:] = items
     except Exception:
         pass
+
+
+def serialize_msg(m):
+    sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
+    sid = getattr(sender, "id", None) or getattr(m, "sender_id", "") or ""
+    sname = (
+        getattr(sender, "first_name", None)
+        or getattr(sender, "title", None)
+        or getattr(sender, "username", None)
+        or str(sid)
+    )
+    txt = getattr(m, "text", None) or getattr(m, "caption", None) or getattr(m, "message", None) or ""
+    return {
+        "id": getattr(m, "id", 0),
+        "sender_id": str(sid),
+        "sender_name": str(sname),
+        "text": str(txt),
+    }
 
 
 async def fetch_recent_messages(chat_id, limit=5):
@@ -238,25 +274,52 @@ async def fetch_recent_messages(chat_id, limit=5):
     peer = parse_peer(chat_id)
     msgs = []
     try:
-        async for m in client.get_messages(peer, limit=limit):
-            sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
-            sid = getattr(sender, "id", None) or getattr(m, "sender_id", "") or ""
-            sname = (
-                getattr(sender, "first_name", None)
-                or getattr(sender, "title", None)
-                or getattr(sender, "username", None)
-                or str(sid)
-            )
-            txt = getattr(m, "text", None) or getattr(m, "caption", None) or ""
-            msgs.append({
-                "id": getattr(m, "id", 0),
-                "sender_id": str(sid),
-                "sender_name": str(sname),
-                "text": str(txt),
-            })
+        res = client.get_messages(peer, limit=limit)
+        if asyncio.iscoroutine(res):
+            res = await res
+        if hasattr(res, "__aiter__"):
+            async for m in res:
+                msgs.append(serialize_msg(m))
+        elif isinstance(res, (list, tuple)):
+            for m in res:
+                msgs.append(serialize_msg(m))
     except Exception:
         pass
     return msgs
+
+
+async def inspect_message_by_link(chat_id, link):
+    mid = extract_msg_id_from_link(link)
+    if mid is None:
+        return {"ok": False, "msg": "فرمت لینک پیام معتبر نیست."}
+    if not client_ready:
+        await ensure_client(force=False)
+    if not client_ready:
+        return {"ok": False, "msg": "اکانت متصل نیست."}
+    peer = parse_peer(chat_id)
+    try:
+        if hasattr(client, "get_messages"):
+            res = client.get_messages(peer, ids=[mid])
+            if asyncio.iscoroutine(res):
+                res = await res
+            if hasattr(res, "__aiter__"):
+                async for m in res:
+                    if getattr(m, "id", None) == mid:
+                        return {"ok": True, "message": serialize_msg(m)}
+            elif isinstance(res, (list, tuple)):
+                for m in res:
+                    if m and getattr(m, "id", None) == mid:
+                        return {"ok": True, "message": serialize_msg(m)}
+            elif res and getattr(res, "id", None) == mid:
+                return {"ok": True, "message": serialize_msg(res)}
+
+        recent = await fetch_recent_messages(chat_id, limit=25)
+        for m in recent:
+            if int(m.get("id") or 0) == mid:
+                return {"ok": True, "message": m}
+        return {"ok": False, "msg": f"پیام #{mid} در این گروه/کانال یافت نشد."}
+    except Exception as e:
+        return {"ok": False, "msg": f"خطا در دریافت پیام: {e}"}
 
 
 async def run_job_worker(job):
@@ -290,10 +353,19 @@ async def run_job_worker(job):
 
         try:
             mode = job.get("mode", "spam")
-            if mode == "forward_msg" and hasattr(client, "forward_messages"):
+            if mode == "forward_msg":
                 src_peer = parse_peer(job.get("source_chat"))
                 msg_id = int(job.get("msg_id") or 0)
-                await asyncio.wait_for(client.forward_messages(peer, src_peer, [msg_id]), timeout=15)
+                if hasattr(client, "forward_messages"):
+                    await asyncio.wait_for(client.forward_messages(peer, src_peer, [msg_id]), timeout=15)
+                else:
+                    await asyncio.wait_for(client.send_message(peer, job.get("payload", "")), timeout=15)
+            elif mode == "reply_loop":
+                msg_id = int(job.get("msg_id") or 0)
+                await asyncio.wait_for(
+                    client.send_message(peer, job.get("payload", ""), reply_to_message_id=msg_id),
+                    timeout=15,
+                )
             else:
                 await asyncio.wait_for(client.send_message(peer, job.get("payload", "")), timeout=15)
 
@@ -301,8 +373,11 @@ async def run_job_worker(job):
             job["logs"].append(f"[{now_str()}] OK -> {raw_t}")
             sent_burst += 1
         except Exception as e:
+            err_txt = str(e)
             job["fail"] = int(job.get("fail") or 0) + 1
-            job["logs"].append(f"[{now_str()}] ERR -> {str(e)[:75]}")
+            job["logs"].append(f"[{now_str()}] ERR -> {err_txt[:80]}")
+            if "key is not registered" in err_txt.lower():
+                await ensure_client(force=True)
 
         job["logs"] = job["logs"][-25:]
         rest_every = int(job.get("rest_every") or 0)
@@ -316,7 +391,6 @@ async def run_job_worker(job):
 
 
 async def offline_side_watcher():
-    # پایش سایدهای افلاینی بگیر بر اساس دقیقه
     last_seen_map = {}
     replied_marker = {}
     while True:
@@ -333,22 +407,17 @@ async def offline_side_watcher():
             if not users or not chat_id or not reply_text:
                 continue
 
-            peer = parse_peer(chat_id)
+            recent = await fetch_recent_messages(chat_id, limit=15)
+            if not recent:
+                continue
+            latest_msg_id = recent[0].get("id")
             target_ids = {str(u.get("id")) for u in users if u.get("id")}
             now_ts = time.time()
-            latest_msg_id = None
 
-            try:
-                async for m in client.get_messages(peer, limit=15):
-                    mid = getattr(m, "id", None)
-                    if latest_msg_id is None and mid is not None:
-                        latest_msg_id = mid
-                    sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
-                    sid = str(getattr(sender, "id", None) or getattr(m, "sender_id", "") or "")
-                    if sid in target_ids:
-                        last_seen_map[(s["id"], sid)] = now_ts
-            except Exception:
-                continue
+            for m in recent:
+                sid = str(m.get("sender_id") or "")
+                if sid in target_ids:
+                    last_seen_map[(s["id"], sid)] = now_ts
 
             all_offline = True
             for sid in target_ids:
@@ -361,6 +430,7 @@ async def offline_side_watcher():
 
             if all_offline and latest_msg_id and replied_marker.get(s["id"]) != latest_msg_id:
                 try:
+                    peer = parse_peer(chat_id)
                     await asyncio.wait_for(
                         client.send_message(peer, reply_text, reply_to_message_id=latest_msg_id),
                         timeout=15,
@@ -468,6 +538,19 @@ def api_recent_messages():
     return jsonify([])
 
 
+@app.route("/api/inspect_link")
+def api_inspect_link():
+    chat_id = (request.args.get("chat_id") or "").strip()
+    link = (request.args.get("link") or "").strip()
+    fut = run_async(inspect_message_by_link(chat_id, link))
+    if fut:
+        try:
+            return jsonify(fut.result(timeout=18))
+        except Exception:
+            pass
+    return jsonify({"ok": False, "msg": "خطا در بررسی لینک."})
+
+
 @app.route("/api/add_job")
 def api_add_job():
     global job_seq
@@ -475,8 +558,13 @@ def api_add_job():
     payload = (request.args.get("payload") or "").strip()
     raw_targets = (request.args.get("targets") or "").strip()
     targets = [x.strip() for x in re.split(r"[,\n]+", raw_targets) if x.strip()]
-    if not targets or (mode != "forward_msg" and not payload):
+    if not targets or (mode == "spam" and not payload) or (mode == "reply_loop" and not payload):
         return jsonify({"ok": False, "msg": "اطلاعات ناقص است."})
+
+    if mode in LIMITED_MODES:
+        active_limited = sum(1 for j in jobs if j.get("running") and j.get("mode") in LIMITED_MODES)
+        if active_limited >= 3:
+            return jsonify({"ok": False, "msg": "محدودیت ۳ تسک هم‌زمان برای فوروارد/اسپم/ریپلای پر شده است."})
 
     job_seq += 1
     job = {
@@ -507,6 +595,10 @@ def api_job_ctrl():
     for j in jobs:
         if j["id"] == jid:
             if act == "toggle":
+                if not j.get("running") and j.get("mode") in LIMITED_MODES:
+                    active_limited = sum(1 for x in jobs if x.get("running") and x.get("mode") in LIMITED_MODES)
+                    if active_limited >= 3:
+                        return jsonify({"ok": False, "msg": "حداکثر ۳ تسک هم‌زمان مجاز است."})
                 j["running"] = not j.get("running", False)
             elif act == "delete":
                 jobs.remove(j)
@@ -521,6 +613,7 @@ def api_side_save():
     sid = (request.args.get("id") or "").strip()
     name = (request.args.get("name") or "ساید").strip()
     chat_id = (request.args.get("chat_id") or "").strip()
+    chat_name = (request.args.get("chat_name") or chat_id).strip()
     minutes = max(1, int(request.args.get("minutes") or 3))
     reply_text = (request.args.get("reply_text") or "").strip()
     enabled = (request.args.get("enabled") or "true").lower() == "true"
@@ -543,6 +636,7 @@ def api_side_save():
     target_side.update({
         "name": name,
         "chat_id": chat_id,
+        "chat_name": chat_name,
         "minutes": minutes,
         "reply_text": reply_text,
         "enabled": enabled,
