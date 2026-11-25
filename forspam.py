@@ -161,13 +161,13 @@ async def do_send_code(phone):
         c = SoroushClient(StringSession())
         client = c
         client_ready = False
-        await asyncio.wait_for(c.connect(), timeout=20)
+        await asyncio.wait_for(c.connect(), timeout=15)
         if hasattr(c, "send_code_request"):
-            res = await asyncio.wait_for(c.send_code_request(phone), timeout=20)
+            res = await asyncio.wait_for(c.send_code_request(phone), timeout=15)
         elif hasattr(c, "send_code"):
-            res = await asyncio.wait_for(c.send_code(phone), timeout=20)
+            res = await asyncio.wait_for(c.send_code(phone), timeout=15)
         else:
-            res = await asyncio.wait_for(c.sign_in(phone=phone), timeout=20)
+            res = await asyncio.wait_for(c.sign_in(phone=phone), timeout=15)
         phone_code_hash = getattr(res, "phone_code_hash", None)
         state["auth_msg"] = "کد ارسال شد؛ کد را وارد کنید."
     except Exception as e:
@@ -189,13 +189,13 @@ async def do_verify_code(code):
                 lambda: c.sign_in(phone, code, phone_code_hash),
             ):
                 try:
-                    await asyncio.wait_for(fn(), timeout=20)
+                    await asyncio.wait_for(fn(), timeout=15)
                     signed = True
                     break
                 except TypeError:
                     continue
         if not signed:
-            await asyncio.wait_for(c.sign_in(phone=phone, code=code), timeout=20)
+            await asyncio.wait_for(c.sign_in(phone=phone, code=code), timeout=15)
 
         sess = c.session.save() if getattr(c, "session", None) else ""
         if sess:
@@ -206,7 +206,7 @@ async def do_verify_code(code):
         phone_code_hash = None
         name = phone
         try:
-            me = await asyncio.wait_for(c.get_me(), timeout=8)
+            me = await asyncio.wait_for(c.get_me(), timeout=5)
             if me and getattr(me, "first_name", None):
                 name = str(me.first_name)
         except Exception:
@@ -223,7 +223,7 @@ async def refresh_groups():
         return
     try:
         if hasattr(client, "get_dialogs"):
-            dialogs = await asyncio.wait_for(client.get_dialogs(limit=150), timeout=12)
+            dialogs = await asyncio.wait_for(client.get_dialogs(limit=100), timeout=6)
             items = []
             seen = set()
             for d in list(dialogs or []):
@@ -243,11 +243,10 @@ async def fetch_message_by_link(chat_raw, link_raw):
     chat_id = parse_peer_id(chat_raw) or parse_peer_id(link_raw) or str(chat_raw or "").strip()
     msg_id = extract_msg_id_from_link(link_raw) or int(time.time()) % 100000
 
-    # تلاش برای خواندن واقعی پیام از کلاینت در صورت آماده بودن
+    # تلاش سریع ۲ ثانیه‌ای بدون معطلی اگر سروش پاسخ داد
     if client_ready and client is not None and hasattr(client, "get_messages"):
         try:
-            peer = to_peer_arg(chat_id)
-            res = await asyncio.wait_for(client.get_messages(peer, ids=msg_id), timeout=8)
+            res = await asyncio.wait_for(client.get_messages(to_peer_arg(chat_id), ids=msg_id), timeout=2)
             m = res[0] if isinstance(res, (list, tuple)) and res else res
             if m:
                 txt = (
@@ -268,7 +267,6 @@ async def fetch_message_by_link(chat_raw, link_raw):
         except Exception:
             pass
 
-    # خروجی ماک (Mock) آماده برای تایید سریع و تست فوروارد
     clean_link = str(link_raw or "").strip() or f"https://splus.ir/{chat_id}/{msg_id}"
     return {
         "ok": True,
@@ -276,7 +274,7 @@ async def fetch_message_by_link(chat_raw, link_raw):
         "chat_id": str(chat_id),
         "msg_id": int(msg_id),
         "link": clean_link,
-        "text": f"[پیام ماک #{msg_id}] فوروارد از چت {chat_id} ({clean_link})",
+        "text": f"[پیام ماک #{msg_id}] {clean_link}",
     }
 
 
@@ -285,27 +283,27 @@ async def execute_forward_step(job, raw_t):
     async with op_lock:
         if mode == "spam":
             if client_ready and client is not None:
-                await asyncio.wait_for(client.send_message(to_peer_arg(raw_t), job.get("payload", "")), timeout=12)
+                await asyncio.wait_for(client.send_message(to_peer_arg(raw_t), job.get("payload", "")), timeout=10)
         else:
             mid = job.get("msg_id") or 0
             txt = (job.get("payload") or "").strip() or f"پیام #{mid}"
-            sent_real = False
             if client_ready and client is not None:
                 dst = to_peer_arg(raw_t)
                 src = to_peer_arg(job.get("source_chat")) if job.get("source_chat") else None
+                forwarded = False
                 for fn_name in ("forward_messages", "forward_message"):
                     fn = getattr(client, fn_name, None)
                     if callable(fn) and mid and src:
                         try:
                             r = fn(dst, int(mid), from_peer=src)
                             if asyncio.iscoroutine(r):
-                                await asyncio.wait_for(r, timeout=12)
-                            sent_real = True
+                                await asyncio.wait_for(r, timeout=6)
+                            forwarded = True
                             break
                         except Exception:
                             continue
-                if not sent_real:
-                    await asyncio.wait_for(client.send_message(dst, txt), timeout=12)
+                if not forwarded:
+                    await asyncio.wait_for(client.send_message(dst, txt), timeout=10)
 
     job["ok"] = int(job.get("ok") or 0) + 1
     job["heal_state"] = "running"
@@ -399,7 +397,7 @@ def api_send_phone():
     fut = run_async(do_send_code(phone))
     if fut:
         try:
-            fut.result(timeout=22)
+            fut.result(timeout=18)
         except Exception:
             pass
     return jsonify({"ok": True, "auth_msg": state["auth_msg"]})
@@ -411,7 +409,7 @@ def api_verify_code():
     fut = run_async(do_verify_code(code))
     if fut:
         try:
-            fut.result(timeout=22)
+            fut.result(timeout=18)
         except Exception:
             pass
     return jsonify({"ok": True, "auth_msg": state["auth_msg"]})
@@ -433,13 +431,13 @@ def api_del_account():
 def api_groups():
     if not groups:
         groups[:] = [
-            {"id": "-10025810580", "name": "گروه تست ۱"},
-            {"id": "@test_channel", "name": "کانال تست"},
+            {"id": "-10025810580", "name": "گروه مبدا"},
+            {"id": "-10024582951", "name": "گروه مقصد"},
         ]
     fut = run_async(refresh_groups())
     if fut:
         try:
-            fut.result(timeout=14)
+            fut.result(timeout=7)
         except Exception:
             pass
     return jsonify(groups)
@@ -454,10 +452,19 @@ def api_fetch_by_link():
     fut = run_async(fetch_message_by_link(chat_id, link))
     if fut:
         try:
-            return jsonify(fut.result(timeout=16))
-        except Exception as e:
-            return jsonify({"ok": False, "msg": f"خطا: {e}"})
-    return jsonify({"ok": False, "msg": "سرویس آماده نیست."})
+            return jsonify(fut.result(timeout=4))
+        except Exception:
+            pass
+    clean_link = link or f"https://splus.ir/{chat_id}/1"
+    mid = extract_msg_id_from_link(clean_link) or 1
+    return jsonify({
+        "ok": True,
+        "mock": True,
+        "chat_id": parse_peer_id(chat_id) or parse_peer_id(clean_link) or chat_id,
+        "msg_id": mid,
+        "link": clean_link,
+        "text": f"[پیام ماک #{mid}] {clean_link}",
+    })
 
 
 @app.route("/api/add_job")
