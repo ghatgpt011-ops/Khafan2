@@ -26,6 +26,7 @@ app = Flask(__name__)
 
 accounts = []
 groups = []
+cached_dialogs = []
 jobs = []
 job_seq = 0
 
@@ -146,7 +147,7 @@ async def resolve_target_entity(raw_peer):
     return parse_peer(raw_peer)
 
 
-def serialize_msg(m, chat_id=""):
+def serialize_msg(m, chat_id="", idx_fallback=1):
     sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
     sid = getattr(sender, "id", None) or getattr(m, "sender_id", "") or ""
     sname = (
@@ -158,8 +159,9 @@ def serialize_msg(m, chat_id=""):
     txt = getattr(m, "text", None) or getattr(m, "caption", None) or getattr(m, "message", None) or ""
     if not txt and getattr(m, "media", None):
         txt = "[پیام رسانه‌ای / فایل]"
+    mid = getattr(m, "id", None)
     return {
-        "id": getattr(m, "id", 0),
+        "id": int(mid) if mid is not None else int(idx_fallback),
         "chat_id": str(chat_id),
         "sender_id": str(sid),
         "sender_name": str(sname or "کاربر"),
@@ -296,7 +298,7 @@ async def do_verify_code(code):
 
 
 async def refresh_groups():
-    global groups
+    global groups, cached_dialogs
     if not client_ready:
         await ensure_client(force=False)
     if not client_ready:
@@ -305,8 +307,9 @@ async def refresh_groups():
         dialogs = await asyncio.wait_for(client.get_dialogs(limit=200), timeout=15)
         if asyncio.iscoroutine(dialogs):
             dialogs = await dialogs
+        cached_dialogs[:] = list(dialogs or [])
         items = []
-        for d in dialogs:
+        for d in cached_dialogs:
             if getattr(d, "is_group", False) or getattr(d, "is_channel", False):
                 items.append({
                     "id": str(d.id),
@@ -317,40 +320,80 @@ async def refresh_groups():
         pass
 
 
+async def _collect_from_result(res, chat_id, limit):
+    if asyncio.iscoroutine(res):
+        res = await res
+    out = []
+    if hasattr(res, "__aiter__"):
+        async for m in res:
+            if m:
+                out.append(serialize_msg(m, chat_id, len(out) + 1))
+            if len(out) >= limit:
+                break
+    elif isinstance(res, (list, tuple)):
+        for m in res:
+            if m:
+                out.append(serialize_msg(m, chat_id, len(out) + 1))
+            if len(out) >= limit:
+                break
+    elif res:
+        out.append(serialize_msg(res, chat_id, 1))
+    return out[:limit]
+
+
 async def fetch_recent_messages(chat_id, limit=10):
     if not client_ready:
         await ensure_client(force=False)
     if not client_ready:
         return {"ok": False, "msg": "اکانت متصل نیست.", "messages": []}
 
-    last_err = None
-    for p in candidate_peers_for_chat(chat_id):
-        ent = await resolve_target_entity(p)
-        for target in (ent, p):
-            try:
-                res = client.get_messages(target, limit=limit)
-                if asyncio.iscoroutine(res):
-                    res = await res
-                out = []
-                if hasattr(res, "__aiter__"):
-                    async for m in res:
-                        if m:
-                            out.append(serialize_msg(m, str(chat_id)))
-                        if len(out) >= limit:
-                            break
-                elif isinstance(res, (list, tuple)):
-                    for m in res:
-                        if m:
-                            out.append(serialize_msg(m, str(chat_id)))
-                        if len(out) >= limit:
-                            break
-                if out:
-                    return {"ok": True, "messages": out[:limit]}
-            except Exception as e:
-                last_err = e
-                continue
+    # 1) اگر پیام آخری در دیالوگ‌های کش‌شده هست، اول بررسی کن
+    if not cached_dialogs:
+        await refresh_groups()
+    target_strs = {str(x) for x in candidate_peers_for_chat(chat_id)}
+    for d in cached_dialogs:
+        if str(getattr(d, "id", "")) in target_strs:
+            lm = getattr(d, "message", None) or getattr(d, "last_message", None)
+            if lm:
+                pass
 
-    return {"ok": False, "msg": f"دریافت پیام‌های اخیر ناموفق بود: {last_err or 'پیامی یافت نشد'}", "messages": []}
+    last_err = ""
+    peers = candidate_peers_for_chat(chat_id)
+    for p in peers:
+        ent = await resolve_target_entity(p)
+        targets = [ent] if ent is not None and ent != p else []
+        targets.append(p)
+
+        for target in targets:
+            for fn_name in ("get_messages", "iter_messages", "get_history"):
+                fn = getattr(client, fn_name, None)
+                if not callable(fn):
+                    continue
+                for call_fn in (
+                    lambda t=target, l=limit: fn(t, limit=l),
+                    lambda t=target, l=limit: fn(t, l),
+                ):
+                    try:
+                        res = call_fn()
+                        msgs = await asyncio.wait_for(_collect_from_result(res, str(chat_id), limit), timeout=12)
+                        if msgs:
+                            return {"ok": True, "messages": msgs}
+                    except Exception as e:
+                        last_err = str(e)
+                        continue
+
+    # 2) اگر متد خواندن پیام برای این چت خالی یا خطادار بود، آخرین پیام دیالوگ را برگردان
+    for d in cached_dialogs:
+        if str(getattr(d, "id", "")) in target_strs:
+            lm = getattr(d, "message", None) or getattr(d, "last_message", None)
+            if lm:
+                return {"ok": True, "messages": [serialize_msg(lm, str(chat_id), 1)]}
+
+    return {
+        "ok": False,
+        "msg": f"دریافت پیام‌ها ناموفق بود ({last_err or 'پیامی یافت نشد'}).",
+        "messages": [],
+    }
 
 
 async def send_reply_compatible(peer, text, msg_id):
@@ -578,11 +621,11 @@ def api_recent_messages():
     chat_id = (request.args.get("chat_id") or "").strip()
     limit = max(1, min(10, int(request.args.get("limit") or 10)))
     if not chat_id:
-        return jsonify({"ok": False, "msg": "ابتدا مبدا را انتخاب کنید.", "messages": []})
+        return jsonify({"ok": False, "msg": "ابتدا چت را انتخاب کنید.", "messages": []})
     fut = run_async(fetch_recent_messages(chat_id, limit=limit))
     if fut:
         try:
-            return jsonify(fut.result(timeout=20))
+            return jsonify(fut.result(timeout=22))
         except Exception as e:
             return jsonify({"ok": False, "msg": f"خطا: {e}", "messages": []})
     return jsonify({"ok": False, "msg": "سرویس پیام آماده نیست.", "messages": []})
