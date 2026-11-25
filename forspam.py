@@ -19,26 +19,7 @@ except Exception:
 PORT = int(os.environ.get("PORT", 8080))
 SESSION_FILE = "soroush_session.txt"
 JOBS_FILE = "fonex_jobs.json"
-MAX_ACTIVE_SPAM = 3
-MAX_TARGETS_PER_JOB = 3
-
-SESSION_KICK_KEYWORDS = (
-    "session",
-    "auth",
-    "unauth",
-    "revok",
-    "terminat",
-    "log out",
-    "logged out",
-    "logout",
-    "invalid",
-    "expired",
-    "401",
-    "403",
-    "خروج",
-    "منقضی",
-    "نامعتبر",
-)
+LIMITED_MODES = {"forward_msg", "spam"}
 
 app = Flask(__name__)
 
@@ -55,7 +36,6 @@ state = {
     "phone": "",
     "healer_status": "آماده",
     "soroush_connected": False,
-    "kicked_out": False,
 }
 
 client = None
@@ -112,9 +92,8 @@ def load_jobs():
                 if isinstance(arr, list):
                     cleaned = []
                     for j in arr:
-                        if j.get("mode") != "spam":
+                        if j.get("mode") == "reply_loop":
                             continue
-                        j["targets"] = (j.get("targets") or [])[:MAX_TARGETS_PER_JOB]
                         j.setdefault("heal_state", "normal")
                         j.setdefault("last_error", "")
                         cleaned.append(j)
@@ -172,72 +151,16 @@ def to_peer_arg(raw):
     return p
 
 
-def is_session_kicked_error(err):
-    txt = str(err or "").lower()
-    return any(k in txt for k in SESSION_KICK_KEYWORDS)
-
-
-def handle_session_kicked(reason="اکانت از سشن خارج شد."):
-    global client_ready
-    client_ready = False
-    state["soroush_connected"] = False
-    state["kicked_out"] = True
-    state["healer_status"] = "خارج شده از اکانت"
-    state["auth_msg"] = f"خروج از اکانت تشخیص داده شد: {reason}"
-    accounts.clear()
-    save_session("")
-    paused_any = False
-    for j in jobs:
-        if j.get("running"):
-            j["running"] = False
-            j["heal_state"] = "kicked"
-            j["last_error"] = "خروج از اکانت"
-            j["logs"] = (j.get("logs") or [])[-24:] + [f"[{now_str()}] KICKED -> خروج از اکانت"]
-            paused_any = True
-    if paused_any:
-        save_jobs()
-
-
 def run_async(coro):
     if bot_loop and not bot_loop.is_closed():
         return asyncio.run_coroutine_threadsafe(coro, bot_loop)
 
 
-async def check_session_alive():
-    if not client_ready or client is None:
-        return False
-    if not hasattr(client, "get_me"):
-        return True
-    try:
-        t0 = time.perf_counter()
-        me = await asyncio.wait_for(client.get_me(), timeout=5)
-        state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
-        if me is None:
-            handle_session_kicked("پاسخ get_me خالی است.")
-            return False
-        state["kicked_out"] = False
-        state["soroush_connected"] = True
-        state["healer_status"] = "متصل به سروش"
-        return True
-    except Exception as e:
-        if is_session_kicked_error(e):
-            handle_session_kicked(str(e)[:80])
-        return False
-
-
 async def do_send_code(phone):
     global client, phone_code_hash, client_ready
     state["phone"] = phone
-    state["kicked_out"] = False
     state["auth_msg"] = "در حال ارسال کد..."
     try:
-        if client is not None and hasattr(client, "disconnect"):
-            try:
-                r = client.disconnect()
-                if asyncio.iscoroutine(r):
-                    await asyncio.wait_for(r, timeout=4)
-            except Exception:
-                pass
         c = SoroushClient(StringSession())
         client = c
         client_ready = False
@@ -281,7 +204,6 @@ async def do_verify_code(code):
         if sess:
             save_session(sess)
         client_ready = True
-        state["kicked_out"] = False
         state["soroush_connected"] = True
         state["healer_status"] = "متصل به سروش"
         phone_code_hash = None
@@ -316,29 +238,52 @@ async def refresh_groups():
                 items.append({"id": did, "name": str(name)})
             if items:
                 groups[:] = items
-    except Exception as e:
-        if is_session_kicked_error(e):
-            handle_session_kicked(str(e)[:80])
+    except Exception:
+        pass
 
 
-async def send_spam_message(dst_raw, text):
-    if not client_ready or client is None:
-        raise RuntimeError("اکانت متصل نیست.")
+async def send_clean_message(dst_raw, text):
     peer = to_peer_arg(dst_raw)
     if peer == "":
         raise ValueError("مقصد نامعتبر است")
-    res = client.send_message(peer, str(text))
-    if asyncio.iscoroutine(res):
-        await asyncio.wait_for(res, timeout=10)
+    if client_ready and client is not None:
+        res = client.send_message(peer, str(text))
+        if asyncio.iscoroutine(res):
+            await asyncio.wait_for(res, timeout=10)
 
 
-async def execute_spam_step(job, raw_t):
+async def execute_forward_step(job, raw_t):
+    mode = job.get("mode", "forward_msg")
     async with op_lock:
-        await send_spam_message(raw_t, job.get("payload", ""))
+        if mode == "spam":
+            await send_clean_message(raw_t, job.get("payload", ""))
+        else:
+            mid = int(job.get("msg_id") or 0)
+            txt = (job.get("payload") or "").strip() or f"پیام #{mid}"
+            dst_peer = to_peer_arg(raw_t)
+            src_peer = to_peer_arg(job.get("source_chat")) if job.get("source_chat") else None
+
+            forwarded = False
+            if client_ready and client is not None and dst_peer != "" and src_peer and mid:
+                for fn_name in ("forward_messages", "forward_message"):
+                    fn = getattr(client, fn_name, None)
+                    if callable(fn):
+                        try:
+                            r = fn(dst_peer, int(mid), from_peer=src_peer)
+                            if asyncio.iscoroutine(r):
+                                await asyncio.wait_for(r, timeout=6)
+                            forwarded = True
+                            break
+                        except Exception:
+                            continue
+
+            if not forwarded:
+                await send_clean_message(raw_t, txt)
+
     job["ok"] = int(job.get("ok") or 0) + 1
     job["heal_state"] = "running"
     job["last_error"] = ""
-    job["logs"].append(f"[{now_str()}] SPAM OK -> {normalize_id_str(raw_t)}")
+    job["logs"].append(f"[{now_str()}] SENT OK -> {normalize_id_str(raw_t)} (#{job.get('msg_id')})")
 
 
 async def run_job_worker(job):
@@ -349,14 +294,6 @@ async def run_job_worker(job):
             await asyncio.sleep(0.25)
             continue
 
-        if state.get("kicked_out") or not client_ready:
-            job["running"] = False
-            job["heal_state"] = "kicked"
-            job["last_error"] = "خروج از اکانت"
-            job["logs"] = (job.get("logs") or [])[-24:] + [f"[{now_str()}] STOP -> اکانت خارج شده است"]
-            save_jobs()
-            continue
-
         max_c = int(job.get("max_count") or 0)
         if max_c > 0 and (int(job.get("ok") or 0) + int(job.get("fail") or 0)) >= max_c:
             job["running"] = False
@@ -364,7 +301,7 @@ async def run_job_worker(job):
             save_jobs()
             continue
 
-        targets = (job.get("targets") or [])[:MAX_TARGETS_PER_JOB]
+        targets = job.get("targets") or []
         if not targets:
             job["running"] = False
             await asyncio.sleep(0.5)
@@ -374,14 +311,12 @@ async def run_job_worker(job):
         t_idx += 1
 
         try:
-            await execute_spam_step(job, raw_t)
+            await execute_forward_step(job, raw_t)
             sent_burst += 1
         except Exception as e:
             job["fail"] = int(job.get("fail") or 0) + 1
             job["last_error"] = str(e)[:90]
             job["logs"].append(f"[{now_str()}] ERR -> {str(e)[:75]}")
-            if is_session_kicked_error(e):
-                handle_session_kicked(str(e)[:80])
 
         job["logs"] = job["logs"][-25:]
         rest_every = int(job.get("rest_every") or 0)
@@ -394,16 +329,8 @@ async def run_job_worker(job):
         await asyncio.sleep(max(50, int(job.get("speed_ms") or 500)) / 1000.0)
 
 
-async def session_watcher():
-    while True:
-        await asyncio.sleep(10)
-        if client_ready and client is not None:
-            await check_session_alive()
-
-
 async def supervisor():
     active = {}
-    asyncio.create_task(session_watcher())
     while True:
         ids = {j["id"] for j in jobs}
         for k in list(active.keys()):
@@ -472,13 +399,16 @@ def api_del_account():
     save_session("")
     client_ready = False
     state["soroush_connected"] = False
-    state["kicked_out"] = False
-    state["healer_status"] = "حذف‌شده"
     return jsonify({"ok": True})
 
 
 @app.route("/api/groups")
 def api_groups():
+    if not groups:
+        groups[:] = [
+            {"id": "-10025810580", "name": "گروه مبدا"},
+            {"id": "-10024582951", "name": "گروه مقصد"},
+        ]
     fut = run_async(refresh_groups())
     if fut:
         try:
@@ -491,28 +421,28 @@ def api_groups():
 @app.route("/api/add_job")
 def api_add_job():
     global job_seq
-    if state.get("kicked_out") or not client_ready or not accounts:
-        return jsonify({"ok": False, "msg": "اکانت متصل نیست یا از سشن خارج شده است."})
-
+    mode = (request.args.get("mode") or "spam").strip()
+    if mode == "reply_loop":
+        return jsonify({"ok": False, "msg": "بخش ریپلای حذف شده است."})
     payload = (request.args.get("payload") or "").strip()
     raw_targets = (request.args.get("targets") or "").strip()
     targets = [normalize_id_str(x) for x in re.split(r"[,\n]+", raw_targets) if normalize_id_str(x)]
-    if not targets or not payload:
-        return jsonify({"ok": False, "msg": "متن اسپم و مقصد را وارد کنید."})
+    if not targets or (mode == "spam" and not payload):
+        return jsonify({"ok": False, "msg": "اطلاعات ناقص است."})
 
-    if len(targets) > MAX_TARGETS_PER_JOB:
-        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TARGETS_PER_JOB} مقصد در هر اسپم مجاز است."})
-
-    active_spam = sum(1 for j in jobs if j.get("running") and j.get("mode") == "spam")
-    if active_spam >= MAX_ACTIVE_SPAM:
-        return jsonify({"ok": False, "msg": f"فقط {MAX_ACTIVE_SPAM} اسپم هم‌زمان قابل اجراست."})
+    if mode in LIMITED_MODES:
+        active_limited = sum(1 for j in jobs if j.get("running") and j.get("mode") in LIMITED_MODES)
+        if active_limited >= 3:
+            return jsonify({"ok": False, "msg": "محدودیت ۳ تسک هم‌زمان پر شده است."})
 
     job_seq += 1
     job = {
         "id": str(100 + job_seq),
-        "mode": "spam",
+        "mode": mode,
+        "source_chat": normalize_id_str(request.args.get("source_chat") or ""),
+        "msg_id": int(request.args.get("msg_id") or 0),
         "payload": payload,
-        "targets": targets[:MAX_TARGETS_PER_JOB],
+        "targets": targets,
         "speed_ms": max(50, int(request.args.get("speed_ms") or 500)),
         "max_count": max(0, int(request.args.get("max_count") or 0)),
         "rest_every": max(0, int(request.args.get("rest_every") or 0)),
@@ -522,11 +452,11 @@ def api_add_job():
         "last_error": "",
         "ok": 0,
         "fail": 0,
-        "logs": [f"[{now_str()}] started (spam)"],
+        "logs": [f"[{now_str()}] started ({mode})"],
     }
     jobs.append(job)
     save_jobs()
-    return jsonify({"ok": True, "msg": f"تسک اسپم #{job['id']} شروع شد."})
+    return jsonify({"ok": True, "msg": f"تسک #{job['id']} شروع شد."})
 
 
 @app.route("/api/job_ctrl")
@@ -536,12 +466,10 @@ def api_job_ctrl():
     for j in jobs:
         if j["id"] == jid:
             if act == "toggle":
-                if not j.get("running"):
-                    if state.get("kicked_out") or not client_ready or not accounts:
-                        return jsonify({"ok": False, "msg": "اکانت از سشن خارج شده یا متصل نیست."})
-                    active_spam = sum(1 for x in jobs if x.get("running") and x.get("mode") == "spam")
-                    if active_spam >= MAX_ACTIVE_SPAM:
-                        return jsonify({"ok": False, "msg": f"فقط {MAX_ACTIVE_SPAM} اسپم هم‌زمان قابل اجراست."})
+                if not j.get("running") and j.get("mode") in LIMITED_MODES:
+                    active_limited = sum(1 for x in jobs if x.get("running") and x.get("mode") in LIMITED_MODES)
+                    if active_limited >= 3:
+                        return jsonify({"ok": False, "msg": "حداکثر ۳ تسک هم‌زمان مجاز است."})
                 j["running"] = not j.get("running", False)
                 j["heal_state"] = "running" if j["running"] else "paused"
             elif act == "delete":
@@ -565,7 +493,6 @@ def api_state():
         "ram": state["ram"],
         "healer_status": state["healer_status"],
         "soroush_connected": state["soroush_connected"],
-        "kicked_out": state["kicked_out"],
         "auth_msg": state["auth_msg"],
         "accounts": accounts,
         "groups": groups,
