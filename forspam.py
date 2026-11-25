@@ -103,8 +103,16 @@ def load_jobs():
             pass
 
 
+def normalize_id_str(raw):
+    s = str(raw or "").strip().replace("\u200f", "").replace("\u200e", "")
+    # اگر منفی در انتها افتاده بود مثل 1000024582951-
+    if s.endswith("-") and s[:-1].isdigit():
+        s = "-" + s[:-1]
+    return s
+
+
 def parse_peer_id(raw):
-    s = str(raw or "").strip()
+    s = normalize_id_str(raw)
     if not s:
         return ""
     if "splus.ir" in s or s.startswith("http://") or s.startswith("https://"):
@@ -112,40 +120,36 @@ def parse_peer_id(raw):
         try:
             parts = [p for p in urlparse(url).path.split("/") if p]
             if parts:
-                if parts[0] == "c" and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
-                    cid = parts[1]
-                    return f"-100{cid}" if not cid.startswith("-") else cid
+                if parts[0] == "c" and len(parts) >= 2:
+                    cid = normalize_id_str(parts[1])
+                    if cid.lstrip("-").isdigit():
+                        return f"-100{cid.lstrip('-')}" if not cid.startswith("-") else cid
                 if len(parts) >= 2 and parts[-1].isdigit():
-                    return parts[-2]
-                return parts[0]
+                    return normalize_id_str(parts[-2])
+                return normalize_id_str(parts[0])
         except Exception:
             pass
     m = re.search(r"(?:https?://)?(?:www\.)?splus\.ir/([^/\s?#]+)", s)
     if m:
-        return m.group(1).strip()
+        return normalize_id_str(m.group(1))
     if s.startswith("@"):
         return s[1:].strip()
     return s
 
 
-def extract_msg_id_from_link(raw_link):
-    s = str(raw_link or "").strip()
-    if not s:
-        return None
-    if s.isdigit():
-        return int(s)
-    m = re.search(r"splus\.ir/(?:c/[^/\s?#]+|[^/\s?#]+)/(\d+)", s)
-    if m:
-        return int(m.group(1))
-    parts = [p for p in urlparse(s if s.startswith("http") else "https://" + s).path.split("/") if p]
-    if parts and parts[-1].isdigit():
-        return int(parts[-1])
-    return None
-
-
 def to_peer_arg(raw):
     p = parse_peer_id(raw)
-    return int(p) if p.lstrip("-").isdigit() else p
+    if isinstance(p, (list, tuple, dict)):
+        p = str(p[0]) if p else ""
+    p = str(p or "").strip()
+    if not p:
+        return ""
+    if p.lstrip("-").isdigit():
+        try:
+            return int(p)
+        except Exception:
+            return p
+    return p
 
 
 def run_async(coro):
@@ -240,30 +244,32 @@ async def refresh_groups():
 
 
 async def fetch_message_by_link(chat_raw, link_raw):
-    chat_id = parse_peer_id(chat_raw) or parse_peer_id(link_raw) or str(chat_raw or "").strip()
-    msg_id = extract_msg_id_from_link(link_raw) or int(time.time()) % 100000
+    chat_id = parse_peer_id(chat_raw) or parse_peer_id(link_raw) or normalize_id_str(chat_raw)
+    m = re.search(r"(\d+)\s*$", str(link_raw or "").strip())
+    msg_id = int(m.group(1)) if m else (int(time.time()) % 100000)
 
-    # تلاش سریع ۲ ثانیه‌ای بدون معطلی اگر سروش پاسخ داد
     if client_ready and client is not None and hasattr(client, "get_messages"):
         try:
-            res = await asyncio.wait_for(client.get_messages(to_peer_arg(chat_id), ids=msg_id), timeout=2)
-            m = res[0] if isinstance(res, (list, tuple)) and res else res
-            if m:
-                txt = (
-                    getattr(m, "text", None)
-                    or getattr(m, "message", None)
-                    or getattr(m, "caption", None)
-                    or ""
-                )
-                if str(txt).strip():
-                    return {
-                        "ok": True,
-                        "mock": False,
-                        "chat_id": str(chat_id),
-                        "msg_id": int(getattr(m, "id", None) or msg_id),
-                        "link": str(link_raw or "").strip(),
-                        "text": str(txt).strip(),
-                    }
+            peer = to_peer_arg(chat_id)
+            if peer != "":
+                res = await asyncio.wait_for(client.get_messages(peer, ids=int(msg_id)), timeout=2)
+                item = res[0] if isinstance(res, (list, tuple)) and res else res
+                if item and not isinstance(item, (list, tuple)):
+                    txt = (
+                        getattr(item, "text", None)
+                        or getattr(item, "message", None)
+                        or getattr(item, "caption", None)
+                        or ""
+                    )
+                    if str(txt).strip():
+                        return {
+                            "ok": True,
+                            "mock": False,
+                            "chat_id": str(chat_id),
+                            "msg_id": int(getattr(item, "id", None) or msg_id),
+                            "link": str(link_raw or "").strip(),
+                            "text": str(txt).strip(),
+                        }
         except Exception:
             pass
 
@@ -274,41 +280,52 @@ async def fetch_message_by_link(chat_raw, link_raw):
         "chat_id": str(chat_id),
         "msg_id": int(msg_id),
         "link": clean_link,
-        "text": f"[پیام ماک #{msg_id}] {clean_link}",
+        "text": f"پیام #{msg_id}\n{clean_link}",
     }
+
+
+async def send_clean_message(dst_raw, text):
+    peer = to_peer_arg(dst_raw)
+    if peer == "":
+        raise ValueError("مقصد نامعتبر است")
+    if client_ready and client is not None:
+        res = client.send_message(peer, str(text))
+        if asyncio.iscoroutine(res):
+            await asyncio.wait_for(res, timeout=10)
 
 
 async def execute_forward_step(job, raw_t):
     mode = job.get("mode", "forward_msg")
     async with op_lock:
         if mode == "spam":
-            if client_ready and client is not None:
-                await asyncio.wait_for(client.send_message(to_peer_arg(raw_t), job.get("payload", "")), timeout=10)
+            await send_clean_message(raw_t, job.get("payload", ""))
         else:
-            mid = job.get("msg_id") or 0
+            mid = int(job.get("msg_id") or 0)
             txt = (job.get("payload") or "").strip() or f"پیام #{mid}"
-            if client_ready and client is not None:
-                dst = to_peer_arg(raw_t)
-                src = to_peer_arg(job.get("source_chat")) if job.get("source_chat") else None
-                forwarded = False
+            dst_peer = to_peer_arg(raw_t)
+            src_peer = to_peer_arg(job.get("source_chat")) if job.get("source_chat") else None
+
+            forwarded = False
+            if client_ready and client is not None and dst_peer != "" and src_peer and mid:
                 for fn_name in ("forward_messages", "forward_message"):
                     fn = getattr(client, fn_name, None)
-                    if callable(fn) and mid and src:
+                    if callable(fn):
                         try:
-                            r = fn(dst, int(mid), from_peer=src)
+                            r = fn(dst_peer, int(mid), from_peer=src_peer)
                             if asyncio.iscoroutine(r):
                                 await asyncio.wait_for(r, timeout=6)
                             forwarded = True
                             break
                         except Exception:
                             continue
-                if not forwarded:
-                    await asyncio.wait_for(client.send_message(dst, txt), timeout=10)
+
+            if not forwarded:
+                await send_clean_message(raw_t, txt)
 
     job["ok"] = int(job.get("ok") or 0) + 1
     job["heal_state"] = "running"
     job["last_error"] = ""
-    job["logs"].append(f"[{now_str()}] FWD OK -> {raw_t} (#{job.get('msg_id')})")
+    job["logs"].append(f"[{now_str()}] SENT OK -> {normalize_id_str(raw_t)} (#{job.get('msg_id')})")
 
 
 async def run_job_worker(job):
@@ -455,15 +472,16 @@ def api_fetch_by_link():
             return jsonify(fut.result(timeout=4))
         except Exception:
             pass
-    clean_link = link or f"https://splus.ir/{chat_id}/1"
-    mid = extract_msg_id_from_link(clean_link) or 1
+    clean_link = link or f"https://splus.ir/{chat_id}/8"
+    m = re.search(r"(\d+)\s*$", clean_link)
+    mid = int(m.group(1)) if m else 8
     return jsonify({
         "ok": True,
         "mock": True,
         "chat_id": parse_peer_id(chat_id) or parse_peer_id(clean_link) or chat_id,
         "msg_id": mid,
         "link": clean_link,
-        "text": f"[پیام ماک #{mid}] {clean_link}",
+        "text": f"پیام #{mid}\n{clean_link}",
     })
 
 
@@ -475,7 +493,7 @@ def api_add_job():
         return jsonify({"ok": False, "msg": "بخش ریپلای حذف شده است."})
     payload = (request.args.get("payload") or "").strip()
     raw_targets = (request.args.get("targets") or "").strip()
-    targets = [x.strip() for x in re.split(r"[,\n]+", raw_targets) if x.strip()]
+    targets = [normalize_id_str(x) for x in re.split(r"[,\n]+", raw_targets) if normalize_id_str(x)]
     if not targets or (mode == "spam" and not payload):
         return jsonify({"ok": False, "msg": "اطلاعات ناقص است."})
 
@@ -488,7 +506,7 @@ def api_add_job():
     job = {
         "id": str(100 + job_seq),
         "mode": mode,
-        "source_chat": (request.args.get("source_chat") or "").strip(),
+        "source_chat": normalize_id_str(request.args.get("source_chat") or ""),
         "msg_id": int(request.args.get("msg_id") or 0),
         "payload": payload,
         "targets": targets,
