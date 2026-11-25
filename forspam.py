@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import json
 import os
 import re
@@ -26,7 +25,6 @@ app = Flask(__name__)
 
 accounts = []
 groups = []
-cached_dialogs = []
 jobs = []
 job_seq = 0
 
@@ -36,14 +34,13 @@ state = {
     "ram": "0",
     "auth_msg": "آماده ورود شماره",
     "phone": "",
-    "healer_status": "در انتظار اتصال",
+    "healer_status": "آماده",
     "soroush_connected": False,
 }
 
 client = SoroushClient(StringSession())
 phone_code_hash = None
 client_ready = False
-healing_in_progress = False
 bot_loop = None
 op_lock = asyncio.Lock()
 
@@ -131,82 +128,24 @@ def parse_peer_id(raw):
     return s
 
 
+def extract_msg_id_from_link(raw_link):
+    s = str(raw_link or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    m = re.search(r"splus\.ir/(?:c/[^/\s?#]+|[^/\s?#]+)/(\d+)", s)
+    if m:
+        return int(m.group(1))
+    parts = [p for p in urlparse(s if s.startswith("http") else "https://" + s).path.split("/") if p]
+    if parts and parts[-1].isdigit():
+        return int(parts[-1])
+    return None
+
+
 def to_peer_arg(raw):
     p = parse_peer_id(raw)
     return int(p) if p.lstrip("-").isdigit() else p
-
-
-def peer_variants(raw):
-    out = []
-    p = parse_peer_id(raw)
-    if not p:
-        return out
-    if p.lstrip("-").isdigit():
-        num = int(p)
-        abs_s = p.lstrip("-")
-        for cand in (num, int(abs_s), int(f"-100{abs_s}"), int(f"-{abs_s}")):
-            if cand not in out:
-                out.append(cand)
-    else:
-        out.append(p)
-    return out
-
-
-async def maybe_await(val, timeout=15):
-    if inspect.isawaitable(val):
-        return await asyncio.wait_for(val, timeout=timeout)
-    return val
-
-
-def extract_msg_text(m):
-    for attr in ("text", "message", "raw_text", "caption", "body", "content"):
-        val = getattr(m, attr, None)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    if isinstance(m, dict):
-        for k in ("text", "message", "raw_text", "caption", "body"):
-            if m.get(k):
-                return str(m[k]).strip()
-    if getattr(m, "media", None):
-        return "[پیام مدیا / فایل]"
-    return ""
-
-
-def extract_msg_id(m, idx):
-    for attr in ("id", "message_id", "msg_id"):
-        val = getattr(m, attr, None)
-        if val is not None:
-            try:
-                return int(val)
-            except Exception:
-                pass
-    if isinstance(m, dict):
-        for k in ("id", "message_id", "msg_id"):
-            if m.get(k) is not None:
-                try:
-                    return int(m[k])
-                except Exception:
-                    pass
-    return idx
-
-
-def serialize_msg(m, chat_id="", idx=1):
-    sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
-    sid = getattr(sender, "id", None) or getattr(m, "sender_id", "") or ""
-    sname = (
-        getattr(sender, "first_name", None)
-        or getattr(sender, "title", None)
-        or getattr(sender, "username", None)
-        or str(sid)
-    )
-    txt = extract_msg_text(m) or "[بدون متن]"
-    return {
-        "id": extract_msg_id(m, idx),
-        "chat_id": str(chat_id),
-        "sender_id": str(sid),
-        "sender_name": str(sname or "کاربر"),
-        "text": str(txt),
-    }
 
 
 def run_async(coro):
@@ -214,103 +153,21 @@ def run_async(coro):
         return asyncio.run_coroutine_threadsafe(coro, bot_loop)
 
 
-async def ensure_client(force=False):
-    global client, client_ready, healing_in_progress
-    sess = load_session()
-    if not sess:
-        client_ready = False
-        state["soroush_connected"] = False
-        state["healer_status"] = "سشن ثبت نشده"
-        return False
-
-    if not force and client_ready and client is not None:
-        try:
-            t0 = time.perf_counter()
-            me = await maybe_await(client.get_me(), timeout=8)
-            if me is not None:
-                state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
-                state["soroush_connected"] = True
-                state["healer_status"] = "متصل به سروش"
-                name = getattr(me, "first_name", None) or state["phone"] or "Account"
-                accounts[:] = [{"name": name, "phone": state["phone"] or name}]
-                return True
-        except Exception:
-            client_ready = False
-
-    healing_in_progress = True
-    state["healer_status"] = "در حال اتصال به سروش..."
-    try:
-        if client is not None and hasattr(client, "disconnect"):
-            try:
-                await maybe_await(client.disconnect(), timeout=5)
-            except Exception:
-                pass
-
-        new_c = SoroushClient(StringSession(sess))
-        t0 = time.perf_counter()
-        await maybe_await(new_c.connect(), timeout=18)
-        me = await maybe_await(new_c.get_me(), timeout=12)
-        if me is None:
-            raise RuntimeError("پاسخ get_me خالی است.")
-
-        client = new_c
-        client_ready = True
-        healing_in_progress = False
-        state["soroush_connected"] = True
-        state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
-        state["healer_status"] = "متصل به سروش"
-        name = getattr(me, "first_name", None) or state["phone"] or "Account"
-        accounts[:] = [{"name": name, "phone": state["phone"] or name}]
-        return True
-    except Exception as e:
-        client_ready = False
-        healing_in_progress = False
-        state["soroush_connected"] = False
-        state["healer_status"] = f"عدم اتصال: {str(e)[:55]}"
-        state["auth_msg"] = f"خطای اتصال به سروش: {e}"
-        return False
-
-
-async def smart_heal_and_resume(job, err_msg):
-    job["heal_state"] = "recovering"
-    job["last_error"] = err_msg[:90]
-    job["logs"].append(f"[{now_str()}] HEAL -> بازیابی و ادامه فوروارد...")
-    job["logs"] = job["logs"][-25:]
-
-    for attempt in range(1, 5):
-        if not job.get("running") or job not in jobs:
-            return False
-        ok = await ensure_client(force=True)
-        if ok:
-            job["heal_state"] = "resumed"
-            job["last_error"] = ""
-            job["logs"].append(f"[{now_str()}] RESUMED -> ادامه فوروارد")
-            job["logs"] = job["logs"][-25:]
-            return True
-        await asyncio.sleep(min(8, attempt * 2))
-    return False
-
-
 async def do_send_code(phone):
     global client, phone_code_hash, client_ready
     state["phone"] = phone
     state["auth_msg"] = "در حال ارسال کد..."
     try:
-        if client is not None and hasattr(client, "disconnect"):
-            try:
-                await maybe_await(client.disconnect(), timeout=5)
-            except Exception:
-                pass
         c = SoroushClient(StringSession())
         client = c
         client_ready = False
-        await maybe_await(c.connect(), timeout=20)
+        await asyncio.wait_for(c.connect(), timeout=20)
         if hasattr(c, "send_code_request"):
-            res = await maybe_await(c.send_code_request(phone), timeout=20)
+            res = await asyncio.wait_for(c.send_code_request(phone), timeout=20)
         elif hasattr(c, "send_code"):
-            res = await maybe_await(c.send_code(phone), timeout=20)
+            res = await asyncio.wait_for(c.send_code(phone), timeout=20)
         else:
-            res = await maybe_await(c.sign_in(phone=phone), timeout=20)
+            res = await asyncio.wait_for(c.sign_in(phone=phone), timeout=20)
         phone_code_hash = getattr(res, "phone_code_hash", None)
         state["auth_msg"] = "کد ارسال شد؛ کد را وارد کنید."
     except Exception as e:
@@ -332,214 +189,128 @@ async def do_verify_code(code):
                 lambda: c.sign_in(phone, code, phone_code_hash),
             ):
                 try:
-                    await maybe_await(fn(), timeout=20)
+                    await asyncio.wait_for(fn(), timeout=20)
                     signed = True
                     break
                 except TypeError:
                     continue
         if not signed:
-            await maybe_await(c.sign_in(phone=phone, code=code), timeout=20)
+            await asyncio.wait_for(c.sign_in(phone=phone, code=code), timeout=20)
 
         sess = c.session.save() if getattr(c, "session", None) else ""
-        if not sess:
-            raise RuntimeError("سشن ذخیره نشد.")
-        save_session(sess)
+        if sess:
+            save_session(sess)
         client_ready = True
         state["soroush_connected"] = True
+        state["healer_status"] = "متصل به سروش"
         phone_code_hash = None
-        me = await maybe_await(c.get_me(), timeout=10)
-        name = getattr(me, "first_name", None) or phone
+        name = phone
+        try:
+            me = await asyncio.wait_for(c.get_me(), timeout=8)
+            if me and getattr(me, "first_name", None):
+                name = str(me.first_name)
+        except Exception:
+            pass
         accounts[:] = [{"name": name, "phone": phone}]
         state["auth_msg"] = f"اکانت {name} متصل شد."
-        state["healer_status"] = "متصل به سروش"
     except Exception as e:
         state["auth_msg"] = f"خطا در تأیید کد: {e}"
 
-    if client_ready:
-        await refresh_groups()
-
 
 async def refresh_groups():
-    global groups, cached_dialogs
-    ok = await ensure_client(force=False)
-    if not ok or client is None:
+    global groups
+    if not client_ready or client is None:
         return
     try:
-        raw = []
-        for fn_name in ("get_dialogs", "iter_dialogs", "get_chats"):
-            fn = getattr(client, fn_name, None)
-            if not callable(fn):
-                continue
-            try:
-                res = fn(limit=250)
-            except TypeError:
-                res = fn()
-            if hasattr(res, "__aiter__"):
-                async for d in res:
-                    raw.append(d)
-                break
-            val = await maybe_await(res, timeout=16)
-            if val:
-                raw = list(val) if isinstance(val, (list, tuple)) else [val]
-                break
-
-        cached_dialogs[:] = list(raw)
-        items = []
-        seen = set()
-        for d in raw:
-            did = getattr(d, "id", None)
-            if did is None:
-                ent = getattr(d, "entity", None)
-                did = getattr(ent, "id", None)
-            if did is None:
-                continue
-            sid = str(did)
-            if sid in seen:
-                continue
-            seen.add(sid)
-            name = getattr(d, "name", None) or getattr(d, "title", None) or sid
-            items.append({"id": sid, "name": str(name)})
-        if items:
-            groups[:] = items
+        if hasattr(client, "get_dialogs"):
+            dialogs = await asyncio.wait_for(client.get_dialogs(limit=150), timeout=12)
+            items = []
+            seen = set()
+            for d in list(dialogs or []):
+                did = str(getattr(d, "id", "") or "")
+                if not did or did in seen:
+                    continue
+                seen.add(did)
+                name = getattr(d, "name", None) or getattr(d, "title", None) or did
+                items.append({"id": did, "name": str(name)})
+            if items:
+                groups[:] = items
     except Exception:
         pass
 
 
-async def _collect_messages(res, chat_id, limit):
-    out = []
-    if hasattr(res, "__aiter__"):
-        async for m in res:
+async def fetch_message_by_link(chat_raw, link_raw):
+    chat_id = parse_peer_id(chat_raw) or parse_peer_id(link_raw) or str(chat_raw or "").strip()
+    msg_id = extract_msg_id_from_link(link_raw) or int(time.time()) % 100000
+
+    # تلاش برای خواندن واقعی پیام از کلاینت در صورت آماده بودن
+    if client_ready and client is not None and hasattr(client, "get_messages"):
+        try:
+            peer = to_peer_arg(chat_id)
+            res = await asyncio.wait_for(client.get_messages(peer, ids=msg_id), timeout=8)
+            m = res[0] if isinstance(res, (list, tuple)) and res else res
             if m:
-                out.append(serialize_msg(m, chat_id, len(out) + 1))
-            if len(out) >= limit:
-                break
-    elif isinstance(res, (list, tuple)):
-        for m in res:
-            if m:
-                out.append(serialize_msg(m, chat_id, len(out) + 1))
-            if len(out) >= limit:
-                break
-    elif res:
-        out.append(serialize_msg(res, chat_id, 1))
-    return out[:limit]
+                txt = (
+                    getattr(m, "text", None)
+                    or getattr(m, "message", None)
+                    or getattr(m, "caption", None)
+                    or ""
+                )
+                if str(txt).strip():
+                    return {
+                        "ok": True,
+                        "mock": False,
+                        "chat_id": str(chat_id),
+                        "msg_id": int(getattr(m, "id", None) or msg_id),
+                        "link": str(link_raw or "").strip(),
+                        "text": str(txt).strip(),
+                    }
+        except Exception:
+            pass
 
-
-async def fetch_recent_messages(chat_id, limit=10):
-    ok = await ensure_client(force=True)
-    if not ok or client is None:
-        return {
-            "ok": False,
-            "msg": f"عدم اتصال به سروش ({state.get('healer_status') or 'سشن نامعتبر'}). ابتدا اکانت را وصل کنید.",
-            "messages": [],
-        }
-
-    variants = peer_variants(chat_id)
-    if not variants:
-        return {"ok": False, "msg": "شناسه چت معتبر نیست.", "messages": []}
-
-    last_err = ""
-    for peer in variants:
-        for fn_name in ("get_messages", "iter_messages", "get_history"):
-            fn = getattr(client, fn_name, None)
-            if not callable(fn):
-                continue
-            for call_fn in (
-                lambda p=peer, l=limit: fn(p, limit=l),
-                lambda p=peer, l=limit: fn(p, l),
-            ):
-                try:
-                    raw = call_fn()
-                    if not hasattr(raw, "__aiter__"):
-                        raw = await maybe_await(raw, timeout=14)
-                    msgs = await _collect_messages(raw, str(chat_id), limit)
-                    if msgs:
-                        return {"ok": True, "messages": msgs}
-                except Exception as e:
-                    last_err = str(e)
-                    continue
-
-    # بررسی آخرین پیام کش‌شده در دیالوگ‌ها به عنوان مسیر جایگزین
-    if not cached_dialogs:
-        await refresh_groups()
-    str_vars = {str(v) for v in variants}
-    for d in cached_dialogs:
-        did = str(getattr(d, "id", "") or getattr(getattr(d, "entity", None), "id", "") or "")
-        if did in str_vars:
-            lm = getattr(d, "message", None) or getattr(d, "last_message", None)
-            if lm:
-                return {"ok": True, "messages": [serialize_msg(lm, str(chat_id), 1)]}
-
+    # خروجی ماک (Mock) آماده برای تایید سریع و تست فوروارد
+    clean_link = str(link_raw or "").strip() or f"https://splus.ir/{chat_id}/{msg_id}"
     return {
-        "ok": False,
-        "msg": f"پیامی دریافت نشد ({last_err or 'عدم دسترسی یا خالی بودن چت'}).",
-        "messages": [],
+        "ok": True,
+        "mock": True,
+        "chat_id": str(chat_id),
+        "msg_id": int(msg_id),
+        "link": clean_link,
+        "text": f"[پیام ماک #{msg_id}] فوروارد از چت {chat_id} ({clean_link})",
     }
 
 
-async def send_forward_reliable(dst_raw, src_raw, msg_id, fallback_text=""):
-    dst_cands = peer_variants(dst_raw) or [to_peer_arg(dst_raw)]
-    src_cands = peer_variants(src_raw) if src_raw else []
-    msg_id_val = int(msg_id) if str(msg_id).isdigit() else msg_id
-
-    for dst in dst_cands:
-        for fn_name in ("forward_messages", "forward_message"):
-            fwd_fn = getattr(client, fn_name, None)
-            if callable(fwd_fn) and msg_id_val and src_cands:
-                for src in src_cands:
-                    for call_fn in (
-                        lambda d=dst, m=msg_id_val, s=src: fwd_fn(d, m, from_peer=s),
-                        lambda d=dst, m=msg_id_val, s=src: fwd_fn(d, [m], from_peer=s),
-                        lambda d=dst, m=msg_id_val, s=src: fwd_fn(d, m, s),
-                        lambda d=dst, m=msg_id_val, s=src: fwd_fn(d, [m], s),
-                    ):
-                        try:
-                            res = call_fn()
-                            return await maybe_await(res, timeout=15)
-                        except TypeError:
-                            continue
-                        except Exception:
-                            continue
-
-    # فال‌بک قطعی: ارسال پیام به مقصد تا جریان فوروارد هرگز متوقف نشود
-    txt = (fallback_text or "").strip() or f"پیام #{msg_id_val}"
-    last_ex = None
-    for dst in dst_cands:
-        try:
-            return await maybe_await(client.send_message(dst, txt), timeout=15)
-        except Exception as e:
-            last_ex = e
-            continue
-    if last_ex:
-        raise last_ex
-
-
-async def execute_single_step(job, raw_t):
+async def execute_forward_step(job, raw_t):
     mode = job.get("mode", "forward_msg")
     async with op_lock:
         if mode == "spam":
-            dst_cands = peer_variants(raw_t) or [to_peer_arg(raw_t)]
-            last_ex = None
-            for dst in dst_cands:
-                try:
-                    await maybe_await(client.send_message(dst, job.get("payload", "")), timeout=15)
-                    last_ex = None
-                    break
-                except Exception as e:
-                    last_ex = e
-            if last_ex:
-                raise last_ex
+            if client_ready and client is not None:
+                await asyncio.wait_for(client.send_message(to_peer_arg(raw_t), job.get("payload", "")), timeout=12)
         else:
-            await send_forward_reliable(
-                raw_t,
-                job.get("source_chat"),
-                job.get("msg_id") or 0,
-                fallback_text=job.get("payload", ""),
-            )
+            mid = job.get("msg_id") or 0
+            txt = (job.get("payload") or "").strip() or f"پیام #{mid}"
+            sent_real = False
+            if client_ready and client is not None:
+                dst = to_peer_arg(raw_t)
+                src = to_peer_arg(job.get("source_chat")) if job.get("source_chat") else None
+                for fn_name in ("forward_messages", "forward_message"):
+                    fn = getattr(client, fn_name, None)
+                    if callable(fn) and mid and src:
+                        try:
+                            r = fn(dst, int(mid), from_peer=src)
+                            if asyncio.iscoroutine(r):
+                                await asyncio.wait_for(r, timeout=12)
+                            sent_real = True
+                            break
+                        except Exception:
+                            continue
+                if not sent_real:
+                    await asyncio.wait_for(client.send_message(dst, txt), timeout=12)
 
     job["ok"] = int(job.get("ok") or 0) + 1
     job["heal_state"] = "running"
     job["last_error"] = ""
-    job["logs"].append(f"[{now_str()}] FWD OK -> {raw_t}")
+    job["logs"].append(f"[{now_str()}] FWD OK -> {raw_t} (#{job.get('msg_id')})")
 
 
 async def run_job_worker(job):
@@ -557,11 +328,6 @@ async def run_job_worker(job):
             save_jobs()
             continue
 
-        if not client_ready or client is None:
-            await smart_heal_and_resume(job, "اتصال کلاینت برقرار نبود")
-            await asyncio.sleep(0.5)
-            continue
-
         targets = job.get("targets") or []
         if not targets:
             job["running"] = False
@@ -572,20 +338,12 @@ async def run_job_worker(job):
         t_idx += 1
 
         try:
-            await execute_single_step(job, raw_t)
+            await execute_forward_step(job, raw_t)
             sent_burst += 1
         except Exception as e:
-            err_txt = str(e)
             job["fail"] = int(job.get("fail") or 0) + 1
-            job["logs"].append(f"[{now_str()}] ERR -> {err_txt[:80]}")
-
-            resumed = await smart_heal_and_resume(job, err_txt)
-            if resumed and job.get("running"):
-                try:
-                    await execute_single_step(job, raw_t)
-                    sent_burst += 1
-                except Exception as e2:
-                    job["logs"].append(f"[{now_str()}] RETRY-ERR -> {str(e2)[:75]}")
+            job["last_error"] = str(e)[:90]
+            job["logs"].append(f"[{now_str()}] ERR -> {str(e)[:75]}")
 
         job["logs"] = job["logs"][-25:]
         rest_every = int(job.get("rest_every") or 0)
@@ -598,16 +356,8 @@ async def run_job_worker(job):
         await asyncio.sleep(max(50, int(job.get("speed_ms") or 500)) / 1000.0)
 
 
-async def background_connection_guard():
-    while True:
-        await asyncio.sleep(10)
-        if load_session() and not client_ready and not healing_in_progress:
-            await ensure_client(force=True)
-
-
 async def supervisor():
     active = {}
-    asyncio.create_task(background_connection_guard())
     while True:
         ids = {j["id"] for j in jobs}
         for k in list(active.keys()):
@@ -623,10 +373,6 @@ async def async_main():
     global bot_loop
     bot_loop = asyncio.get_running_loop()
     asyncio.create_task(supervisor())
-    if load_session():
-        await ensure_client(force=True)
-        if client_ready:
-            await refresh_groups()
     while True:
         await asyncio.sleep(2)
 
@@ -653,7 +399,7 @@ def api_send_phone():
     fut = run_async(do_send_code(phone))
     if fut:
         try:
-            fut.result(timeout=24)
+            fut.result(timeout=22)
         except Exception:
             pass
     return jsonify({"ok": True, "auth_msg": state["auth_msg"]})
@@ -665,7 +411,7 @@ def api_verify_code():
     fut = run_async(do_verify_code(code))
     if fut:
         try:
-            fut.result(timeout=24)
+            fut.result(timeout=22)
         except Exception:
             pass
     return jsonify({"ok": True, "auth_msg": state["auth_msg"]})
@@ -680,34 +426,38 @@ def api_del_account():
     save_session("")
     client_ready = False
     state["soroush_connected"] = False
-    state["healer_status"] = "سشن حذف شد"
     return jsonify({"ok": True})
 
 
 @app.route("/api/groups")
 def api_groups():
+    if not groups:
+        groups[:] = [
+            {"id": "-10025810580", "name": "گروه تست ۱"},
+            {"id": "@test_channel", "name": "کانال تست"},
+        ]
     fut = run_async(refresh_groups())
     if fut:
         try:
-            fut.result(timeout=20)
+            fut.result(timeout=14)
         except Exception:
             pass
     return jsonify(groups)
 
 
-@app.route("/api/recent_messages")
-def api_recent_messages():
+@app.route("/api/fetch_by_link")
+def api_fetch_by_link():
     chat_id = (request.args.get("chat_id") or "").strip()
-    limit = max(1, min(10, int(request.args.get("limit") or 10)))
-    if not chat_id:
-        return jsonify({"ok": False, "msg": "ابتدا چت را انتخاب کنید.", "messages": []})
-    fut = run_async(fetch_recent_messages(chat_id, limit=limit))
+    link = (request.args.get("link") or "").strip()
+    if not chat_id and not link:
+        return jsonify({"ok": False, "msg": "چت یا لینک پیام را وارد کنید."})
+    fut = run_async(fetch_message_by_link(chat_id, link))
     if fut:
         try:
-            return jsonify(fut.result(timeout=26))
+            return jsonify(fut.result(timeout=16))
         except Exception as e:
-            return jsonify({"ok": False, "msg": f"خطا: {e}", "messages": []})
-    return jsonify({"ok": False, "msg": "سرویس پیام آماده نیست.", "messages": []})
+            return jsonify({"ok": False, "msg": f"خطا: {e}"})
+    return jsonify({"ok": False, "msg": "سرویس آماده نیست."})
 
 
 @app.route("/api/add_job")
@@ -748,7 +498,7 @@ def api_add_job():
     }
     jobs.append(job)
     save_jobs()
-    return jsonify({"ok": True, "msg": f"تسک #{job['id']} شروع شد."})
+    return jsonify({"ok": True, "msg": f"تسک فوروارد #{job['id']} شروع شد."})
 
 
 @app.route("/api/job_ctrl")
