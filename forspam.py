@@ -119,38 +119,66 @@ def parse_peer(raw):
     return int(s) if s.lstrip("-").isdigit() else s
 
 
-async def resolve_target_entity(raw_peer):
-    peer = parse_peer(raw_peer)
-    for fn_name in ("get_input_entity", "get_entity"):
-        fn = getattr(client, fn_name, None)
-        if callable(fn):
-            try:
-                res = fn(peer)
-                if asyncio.iscoroutine(res):
-                    ent = await asyncio.wait_for(res, timeout=10)
-                else:
-                    ent = res
-                if ent is not None:
-                    return ent
-            except Exception:
-                continue
-    return peer
-
-
-def extract_msg_id(link):
+def parse_link_chat_and_msg(link):
     s = str(link or "").strip()
-    m = re.search(r"splus\.ir/c/-?\d+/(\d+)", s)
-    if m:
-        return int(m.group(1))
-    m2 = re.search(r"/(\d+)(?:[/?#]|$)", s)
-    if m2:
-        return int(m2.group(1))
-    if s.isdigit():
-        return int(s)
-    return None
+    if not s:
+        return None, None
+    u = s if s.startswith("http") else "https://" + s
+    parts = [p for p in urlparse(u).path.split("/") if p]
+    chat_part = None
+    msg_id = None
+
+    if len(parts) >= 3 and parts[0] == "c":
+        raw_c = parts[1]
+        chat_part = int(f"-100{raw_c}") if not raw_c.startswith("-") else int(raw_c)
+        if parts[2].isdigit():
+            msg_id = int(parts[2])
+    elif len(parts) >= 2 and parts[-1].isdigit():
+        msg_id = int(parts[-1])
+        chat_part = parts[-2]
+    elif len(parts) == 1 and parts[0].isdigit():
+        msg_id = int(parts[0])
+
+    if msg_id is None:
+        m = re.search(r"/(\d+)(?:[/?#]|$)", s)
+        if m:
+            msg_id = int(m.group(1))
+    return chat_part, msg_id
 
 
-def serialize_msg(m):
+def candidate_peers_for_chat(raw_chat):
+    cands = []
+    if raw_chat is None or str(raw_chat).strip() == "":
+        return cands
+    s = str(raw_chat).strip()
+    if s.lstrip("-").isdigit():
+        num = int(s)
+        abs_s = s.lstrip("-")
+        for v in (num, int(abs_s), int(f"-100{abs_s}"), int(f"-{abs_s}")):
+            if v not in cands:
+                cands.append(v)
+    else:
+        cands.append(s)
+    return cands
+
+
+async def resolve_target_entity(raw_peer):
+    for peer in candidate_peers_for_chat(raw_peer):
+        for fn_name in ("get_input_entity", "get_entity"):
+            fn = getattr(client, fn_name, None)
+            if callable(fn):
+                try:
+                    res = fn(peer)
+                    ent = await asyncio.wait_for(res, timeout=10) if asyncio.iscoroutine(res) else res
+                    if ent is not None:
+                        return ent
+                except Exception:
+                    continue
+    p = parse_peer(raw_peer)
+    return p
+
+
+def serialize_msg(m, chat_id=""):
     sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
     sid = getattr(sender, "id", None) or getattr(m, "sender_id", "") or ""
     sname = (
@@ -162,6 +190,7 @@ def serialize_msg(m):
     txt = getattr(m, "text", None) or getattr(m, "caption", None) or getattr(m, "message", None) or ""
     return {
         "id": getattr(m, "id", 0),
+        "chat_id": str(chat_id),
         "sender_id": str(sid),
         "sender_name": str(sname),
         "text": str(txt),
@@ -215,7 +244,7 @@ async def ensure_client(force=False):
 async def smart_heal_and_resume(job, err_msg):
     job["heal_state"] = "recovering"
     job["last_error"] = err_msg[:90]
-    job["logs"].append(f"[{now_str()}] HEAL -> تلاش برای بازیابی و ادامه دستور...")
+    job["logs"].append(f"[{now_str()}] HEAL -> بازیابی و ادامه دستور...")
     job["logs"] = job["logs"][-25:]
 
     for attempt in range(1, 5):
@@ -229,7 +258,6 @@ async def smart_heal_and_resume(job, err_msg):
             job["logs"] = job["logs"][-25:]
             return True
         await asyncio.sleep(min(8, attempt * 2))
-
     return False
 
 
@@ -319,45 +347,52 @@ async def refresh_groups():
         pass
 
 
-async def inspect_message_by_link(chat_id, link):
-    mid = extract_msg_id(link)
+async def _scan_msgs_for_id(res, mid, chat_label):
+    if asyncio.iscoroutine(res):
+        res = await res
+    if hasattr(res, "__aiter__"):
+        async for m in res:
+            if int(getattr(m, "id", 0) or 0) == mid:
+                return serialize_msg(m, chat_label)
+    elif isinstance(res, (list, tuple)):
+        for m in res:
+            if m and int(getattr(m, "id", 0) or 0) == mid:
+                return serialize_msg(m, chat_label)
+    elif res and int(getattr(res, "id", 0) or 0) == mid:
+        return serialize_msg(res, chat_label)
+    return None
+
+
+async def inspect_message_from_link(link):
+    chat_part, mid = parse_link_chat_and_msg(link)
     if mid is None:
-        return {"ok": False, "msg": "لینک پیام نامعتبر است."}
+        return {"ok": False, "msg": "نتوانستم شماره پیام را از لینک بخوانم."}
     if not client_ready:
         await ensure_client(force=False)
     if not client_ready:
         return {"ok": False, "msg": "اکانت متصل نیست."}
-    peer = await resolve_target_entity(chat_id)
-    try:
-        res = client.get_messages(peer, ids=[mid])
-        if asyncio.iscoroutine(res):
-            res = await res
-        if hasattr(res, "__aiter__"):
-            async for m in res:
-                if getattr(m, "id", None) == mid:
-                    return {"ok": True, "message": serialize_msg(m)}
-        elif isinstance(res, (list, tuple)):
-            for m in res:
-                if m and getattr(m, "id", None) == mid:
-                    return {"ok": True, "message": serialize_msg(m)}
-        elif res and getattr(res, "id", None) == mid:
-            return {"ok": True, "message": serialize_msg(res)}
 
-        recent_res = client.get_messages(peer, limit=25)
-        if asyncio.iscoroutine(recent_res):
-            recent_res = await recent_res
-        if hasattr(recent_res, "__aiter__"):
-            async for m in recent_res:
-                if getattr(m, "id", None) == mid:
-                    return {"ok": True, "message": serialize_msg(m)}
-        elif isinstance(recent_res, (list, tuple)):
-            for m in recent_res:
-                if m and getattr(m, "id", None) == mid:
-                    return {"ok": True, "message": serialize_msg(m)}
+    peers_to_try = candidate_peers_for_chat(chat_part)
+    if not peers_to_try:
+        peers_to_try = [g["id"] for g in groups[:20]]
 
-        return {"ok": False, "msg": f"پیام #{mid} در این گروه/کانال یافت نشد."}
-    except Exception as e:
-        return {"ok": False, "msg": f"خطا در بررسی لینک: {e}"}
+    for p in peers_to_try:
+        ent = await resolve_target_entity(p)
+        for target in (ent, p):
+            try:
+                res = client.get_messages(target, ids=[mid])
+                found = await _scan_msgs_for_id(res, mid, str(p))
+                if found:
+                    return {"ok": True, "message": found}
+
+                res2 = client.get_messages(target, limit=30)
+                found2 = await _scan_msgs_for_id(res2, mid, str(p))
+                if found2:
+                    return {"ok": True, "message": found2}
+            except Exception:
+                continue
+
+    return {"ok": False, "msg": f"پیام #{mid} با این لینک خوانده نشد؛ مطمئن شو اکانت در گروه/کانال عضو است."}
 
 
 async def send_reply_compatible(peer, text, msg_id):
@@ -375,10 +410,10 @@ async def send_reply_compatible(peer, text, msg_id):
         params = list(sig.parameters.keys())
         for cand in ("reply_to", "reply_to_msg_id", "reply_to_message_id", "reply_id", "message_id"):
             if cand in params:
-                kw_candidates.append({cand: msg_id})
+                kw_candidates.append({cand: int(msg_id)})
     for cand in ("reply_to", "reply_to_msg_id", "reply_id"):
         if not any(cand in d for d in kw_candidates):
-            kw_candidates.append({cand: msg_id})
+            kw_candidates.append({cand: int(msg_id)})
 
     for kw in kw_candidates:
         try:
@@ -389,56 +424,40 @@ async def send_reply_compatible(peer, text, msg_id):
     return await asyncio.wait_for(client.send_message(peer, text), timeout=15)
 
 
-async def forward_msg_compatible(dst_peer, src_peer, msg_id, fallback_text=""):
+async def send_forward_compatible(dst_ent, src_raw, msg_id, fallback_text=""):
     fwd_fn = getattr(client, "forward_messages", None) or getattr(client, "forward_message", None)
-    dst_ent = await resolve_target_entity(dst_peer)
-    src_ent = await resolve_target_entity(src_peer) if src_peer else None
-    last_err = None
-
-    if callable(fwd_fn) and msg_id:
-        pairs = [(dst_ent, src_ent)]
-        if (dst_peer, src_peer) != (dst_ent, src_ent):
-            pairs.append((dst_peer, src_peer))
-
-        for d_target, s_target in pairs:
-            if not s_target:
+    if callable(fwd_fn) and msg_id and src_raw:
+        src_ent = await resolve_target_entity(src_raw)
+        for dt, st in ((dst_ent, src_ent), (dst_ent, parse_peer(src_raw))):
+            if not st:
                 continue
-            attempts = [
-                lambda dt=d_target, st=s_target: fwd_fn(dt, [int(msg_id)], st),
-                lambda dt=d_target, st=s_target: fwd_fn(dt, int(msg_id), st),
-                lambda dt=d_target, st=s_target: fwd_fn(st, [int(msg_id)], dt),
-                lambda dt=d_target, st=s_target: fwd_fn(st, int(msg_id), dt),
-            ]
-            for fn in attempts:
+            for fn in (
+                lambda a=dt, b=st: fwd_fn(a, [int(msg_id)], b),
+                lambda a=dt, b=st: fwd_fn(a, int(msg_id), b),
+            ):
                 try:
                     res = fn()
-                    if asyncio.iscoroutine(res):
-                        return await asyncio.wait_for(res, timeout=15)
-                    return res
-                except TypeError as e:
-                    last_err = e
+                    return await asyncio.wait_for(res, timeout=15) if asyncio.iscoroutine(res) else res
+                except Exception:
                     continue
-                except Exception as e:
-                    last_err = e
-                    if "cannot cast list to any kind of peer" in str(e).lower() or "peer" in str(e).lower():
-                        continue
-                    raise
 
-    text_to_send = (fallback_text or "").strip() or f"پیام #{msg_id}"
-    return await asyncio.wait_for(client.send_message(dst_ent, text_to_send), timeout=15)
+    text_out = (fallback_text or "").strip() or f"پیام #{msg_id}"
+    return await asyncio.wait_for(client.send_message(dst_ent, text_out), timeout=15)
 
 
-async def execute_single_step(job, peer, raw_t):
+async def execute_single_step(job, dst_ent, raw_t):
     mode = job.get("mode", "spam")
     if mode == "forward_msg":
-        src_peer = parse_peer(job.get("source_chat"))
-        msg_id = int(job.get("msg_id") or 0)
-        await forward_msg_compatible(peer, src_peer, msg_id, fallback_text=job.get("payload", ""))
+        await send_forward_compatible(
+            dst_ent,
+            job.get("source_chat"),
+            int(job.get("msg_id") or 0),
+            fallback_text=job.get("payload", ""),
+        )
     elif mode == "reply_loop":
-        msg_id = int(job.get("msg_id") or 0)
-        await send_reply_compatible(peer, job.get("payload", ""), msg_id)
+        await send_reply_compatible(dst_ent, job.get("payload", ""), int(job.get("msg_id") or 0))
     else:
-        await asyncio.wait_for(client.send_message(peer, job.get("payload", "")), timeout=15)
+        await asyncio.wait_for(client.send_message(dst_ent, job.get("payload", "")), timeout=15)
 
     job["ok"] = int(job.get("ok") or 0) + 1
     job["heal_state"] = "running"
@@ -474,10 +493,10 @@ async def run_job_worker(job):
 
         raw_t = targets[t_idx % len(targets)]
         t_idx += 1
-        peer = await resolve_target_entity(raw_t)
+        dst_ent = await resolve_target_entity(raw_t)
 
         try:
-            await execute_single_step(job, peer, raw_t)
+            await execute_single_step(job, dst_ent, raw_t)
             sent_burst += 1
         except Exception as e:
             err_txt = str(e)
@@ -487,7 +506,7 @@ async def run_job_worker(job):
             resumed = await smart_heal_and_resume(job, err_txt)
             if resumed and job.get("running"):
                 try:
-                    await execute_single_step(job, peer, raw_t)
+                    await execute_single_step(job, dst_ent, raw_t)
                     sent_burst += 1
                 except Exception as e2:
                     job["logs"].append(f"[{now_str()}] RETRY-ERR -> {str(e2)[:75]}")
@@ -598,12 +617,11 @@ def api_groups():
 
 @app.route("/api/inspect_link")
 def api_inspect_link():
-    chat_id = (request.args.get("chat_id") or "").strip()
     link = (request.args.get("link") or "").strip()
-    fut = run_async(inspect_message_by_link(chat_id, link))
+    fut = run_async(inspect_message_from_link(link))
     if fut:
         try:
-            return jsonify(fut.result(timeout=18))
+            return jsonify(fut.result(timeout=20))
         except Exception:
             pass
     return jsonify({"ok": False, "msg": "خطا در بررسی لینک."})
