@@ -362,15 +362,12 @@ async def send_reply_compatible(peer, text, msg_id):
         if not any(cand in d for d in kw_candidates):
             kw_candidates.append({cand: msg_id})
 
-    last_err = None
     for kw in kw_candidates:
         try:
             return await asyncio.wait_for(client.send_message(peer, text, **kw), timeout=15)
-        except TypeError as e:
-            last_err = e
+        except TypeError:
             continue
 
-    # اگر هیچ نام آرگومان ریپلای در send_message پشتیبانی نشد، ارسال عادی انجام شود تا تسک خطا ندهد
     return await asyncio.wait_for(client.send_message(peer, text), timeout=15)
 
 
@@ -378,14 +375,12 @@ async def forward_msg_compatible(dst_peer, src_peer, msg_id, fallback_text=""):
     fwd_fn = getattr(client, "forward_messages", None) or getattr(client, "forward_message", None)
     last_err = None
 
-    if callable(fwd_fn):
+    if callable(fwd_fn) and msg_id:
         attempts = [
-            lambda: fwd_fn(src_peer, [msg_id], dst_peer),
-            lambda: fwd_fn(dst_peer, [msg_id], src_peer),
-            lambda: fwd_fn(src_peer, msg_id, dst_peer),
-            lambda: fwd_fn(dst_peer, msg_id, src_peer),
-            lambda: fwd_fn(from_peer=src_peer, message_ids=[msg_id], to_peer=dst_peer),
-            lambda: fwd_fn(chat_id=dst_peer, from_chat_id=src_peer, message_id=msg_id),
+            lambda: fwd_fn(dst_peer, [int(msg_id)], src_peer),
+            lambda: fwd_fn(dst_peer, int(msg_id), src_peer),
+            lambda: fwd_fn(src_peer, [int(msg_id)], dst_peer),
+            lambda: fwd_fn(src_peer, int(msg_id), dst_peer),
         ]
         for fn in attempts:
             try:
@@ -398,7 +393,7 @@ async def forward_msg_compatible(dst_peer, src_peer, msg_id, fallback_text=""):
                 continue
             except Exception as e:
                 last_err = e
-                if "cannot cast list to any kind of peer" in str(e).lower():
+                if "cannot cast list to any kind of peer" in str(e).lower() or "peer" in str(e).lower():
                     continue
                 raise
 
