@@ -58,7 +58,7 @@ state = {
     "kicked_out": False,
 }
 
-client = SoroushClient(StringSession())
+client = None
 phone_code_hash = None
 client_ready = False
 bot_loop = None
@@ -209,7 +209,9 @@ async def check_session_alive():
     if not hasattr(client, "get_me"):
         return True
     try:
-        me = await asyncio.wait_for(client.get_me(), timeout=6)
+        t0 = time.perf_counter()
+        me = await asyncio.wait_for(client.get_me(), timeout=5)
+        state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
         if me is None:
             handle_session_kicked("پاسخ get_me خالی است.")
             return False
@@ -229,6 +231,13 @@ async def do_send_code(phone):
     state["kicked_out"] = False
     state["auth_msg"] = "در حال ارسال کد..."
     try:
+        if client is not None and hasattr(client, "disconnect"):
+            try:
+                r = client.disconnect()
+                if asyncio.iscoroutine(r):
+                    await asyncio.wait_for(r, timeout=4)
+            except Exception:
+                pass
         c = SoroushClient(StringSession())
         client = c
         client_ready = False
@@ -291,7 +300,7 @@ async def do_verify_code(code):
 
 async def refresh_groups():
     global groups
-    if not await check_session_alive():
+    if not client_ready or client is None:
         return
     try:
         if hasattr(client, "get_dialogs"):
@@ -313,8 +322,8 @@ async def refresh_groups():
 
 
 async def send_spam_message(dst_raw, text):
-    if not await check_session_alive():
-        raise RuntimeError("اکانت متصل نیست یا از سشن خارج شده است.")
+    if not client_ready or client is None:
+        raise RuntimeError("اکانت متصل نیست.")
     peer = to_peer_arg(dst_raw)
     if peer == "":
         raise ValueError("مقصد نامعتبر است")
@@ -387,7 +396,7 @@ async def run_job_worker(job):
 
 async def session_watcher():
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
         if client_ready and client is not None:
             await check_session_alive()
 
@@ -544,12 +553,6 @@ def api_job_ctrl():
 
 @app.route("/api/state")
 def api_state():
-    fut = run_async(check_session_alive())
-    if fut:
-        try:
-            fut.result(timeout=3)
-        except Exception:
-            pass
     if psutil:
         try:
             state["cpu"] = str(int(psutil.cpu_percent(interval=None)))
