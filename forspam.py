@@ -119,6 +119,24 @@ def parse_peer(raw):
     return int(s) if s.lstrip("-").isdigit() else s
 
 
+async def resolve_target_entity(raw_peer):
+    peer = parse_peer(raw_peer)
+    for fn_name in ("get_input_entity", "get_entity"):
+        fn = getattr(client, fn_name, None)
+        if callable(fn):
+            try:
+                res = fn(peer)
+                if asyncio.iscoroutine(res):
+                    ent = await asyncio.wait_for(res, timeout=10)
+                else:
+                    ent = res
+                if ent is not None:
+                    return ent
+            except Exception:
+                continue
+    return peer
+
+
 def extract_msg_id(link):
     s = str(link or "").strip()
     m = re.search(r"splus\.ir/c/-?\d+/(\d+)", s)
@@ -309,7 +327,7 @@ async def inspect_message_by_link(chat_id, link):
         await ensure_client(force=False)
     if not client_ready:
         return {"ok": False, "msg": "اکانت متصل نیست."}
-    peer = parse_peer(chat_id)
+    peer = await resolve_target_entity(chat_id)
     try:
         res = client.get_messages(peer, ids=[mid])
         if asyncio.iscoroutine(res):
@@ -373,33 +391,41 @@ async def send_reply_compatible(peer, text, msg_id):
 
 async def forward_msg_compatible(dst_peer, src_peer, msg_id, fallback_text=""):
     fwd_fn = getattr(client, "forward_messages", None) or getattr(client, "forward_message", None)
+    dst_ent = await resolve_target_entity(dst_peer)
+    src_ent = await resolve_target_entity(src_peer) if src_peer else None
     last_err = None
 
     if callable(fwd_fn) and msg_id:
-        attempts = [
-            lambda: fwd_fn(dst_peer, [int(msg_id)], src_peer),
-            lambda: fwd_fn(dst_peer, int(msg_id), src_peer),
-            lambda: fwd_fn(src_peer, [int(msg_id)], dst_peer),
-            lambda: fwd_fn(src_peer, int(msg_id), dst_peer),
-        ]
-        for fn in attempts:
-            try:
-                res = fn()
-                if asyncio.iscoroutine(res):
-                    return await asyncio.wait_for(res, timeout=15)
-                return res
-            except TypeError as e:
-                last_err = e
-                continue
-            except Exception as e:
-                last_err = e
-                if "cannot cast list to any kind of peer" in str(e).lower() or "peer" in str(e).lower():
-                    continue
-                raise
+        pairs = [(dst_ent, src_ent)]
+        if (dst_peer, src_peer) != (dst_ent, src_ent):
+            pairs.append((dst_peer, src_peer))
 
-    if fallback_text:
-        return await asyncio.wait_for(client.send_message(dst_peer, fallback_text), timeout=15)
-    raise last_err or RuntimeError("امکان فوروارد پیام وجود نداشت.")
+        for d_target, s_target in pairs:
+            if not s_target:
+                continue
+            attempts = [
+                lambda dt=d_target, st=s_target: fwd_fn(dt, [int(msg_id)], st),
+                lambda dt=d_target, st=s_target: fwd_fn(dt, int(msg_id), st),
+                lambda dt=d_target, st=s_target: fwd_fn(st, [int(msg_id)], dt),
+                lambda dt=d_target, st=s_target: fwd_fn(st, int(msg_id), dt),
+            ]
+            for fn in attempts:
+                try:
+                    res = fn()
+                    if asyncio.iscoroutine(res):
+                        return await asyncio.wait_for(res, timeout=15)
+                    return res
+                except TypeError as e:
+                    last_err = e
+                    continue
+                except Exception as e:
+                    last_err = e
+                    if "cannot cast list to any kind of peer" in str(e).lower() or "peer" in str(e).lower():
+                        continue
+                    raise
+
+    text_to_send = (fallback_text or "").strip() or f"پیام #{msg_id}"
+    return await asyncio.wait_for(client.send_message(dst_ent, text_to_send), timeout=15)
 
 
 async def execute_single_step(job, peer, raw_t):
@@ -448,7 +474,7 @@ async def run_job_worker(job):
 
         raw_t = targets[t_idx % len(targets)]
         t_idx += 1
-        peer = parse_peer(raw_t)
+        peer = await resolve_target_entity(raw_t)
 
         try:
             await execute_single_step(job, peer, raw_t)
