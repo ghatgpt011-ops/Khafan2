@@ -19,19 +19,21 @@ except Exception:
 PORT = int(os.environ.get("PORT", 8080))
 SESSION_FILE = "soroush_session.txt"
 JOBS_FILE = "fonex_jobs.json"
+SIDES_FILE = "fonex_sides.json"
 
 app = Flask(__name__)
 
 accounts = []
 groups = []
 jobs = []
+sides = []
 job_seq = 0
+side_seq = 0
 
 state = {
     "ping": "12 ms",
     "cpu": "0",
     "ram": "0",
-    "auth_status": "disconnected",
     "auth_msg": "آماده ورود شماره",
     "phone": "",
 }
@@ -73,28 +75,27 @@ def load_session():
     return ""
 
 
-def save_jobs():
+def save_json(path, data):
     try:
-        with open(JOBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(jobs, f, ensure_ascii=False, indent=2)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
 
-def load_jobs():
-    global jobs, job_seq
-    if os.path.exists(JOBS_FILE):
+def load_json(path, default):
+    if os.path.exists(path):
         try:
-            with open(JOBS_FILE, "r", encoding="utf-8") as f:
-                arr = json.load(f)
-                if isinstance(arr, list):
-                    jobs = arr
-                    job_seq = len(jobs)
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, type(default)):
+                    return d
         except Exception:
             pass
+    return default
 
 
-def parse_target(raw):
+def parse_peer(raw):
     s = str(raw or "").strip()
     if not s:
         return ""
@@ -103,14 +104,14 @@ def parse_target(raw):
         parts = [p for p in urlparse(u).path.split("/") if p]
         if parts:
             if parts[0] == "c" and len(parts) >= 2:
-                return f"-100{parts[1]}" if not parts[1].startswith("-") else parts[1]
+                return int(f"-100{parts[1]}") if not parts[1].startswith("-") else int(parts[1])
             return parts[0]
     m = re.search(r"splus\.ir/([^/\s?#]+)", s)
     if m:
-        return m.group(1)
+        s = m.group(1)
     if s.startswith("@"):
-        return s[1:]
-    return s
+        s = s[1:]
+    return int(s) if s.lstrip("-").isdigit() else s
 
 
 def run_async(coro):
@@ -153,7 +154,6 @@ async def ensure_client(force=False):
 async def do_send_code(phone):
     global client, phone_code_hash, client_ready
     state["phone"] = phone
-    state["auth_status"] = "code_sent"
     state["auth_msg"] = "در حال ارسال کد..."
     async with lock:
         try:
@@ -209,7 +209,6 @@ async def do_verify_code(code):
             me = await asyncio.wait_for(client.get_me(), timeout=10)
             name = getattr(me, "first_name", None) or phone
             accounts[:] = [{"name": name, "phone": phone}]
-            state["auth_status"] = "connected"
             state["auth_msg"] = f"اکانت {name} متصل شد."
             await refresh_groups()
         except Exception as e:
@@ -231,10 +230,38 @@ async def refresh_groups():
         pass
 
 
+async def fetch_recent_messages(chat_id, limit=5):
+    if not client_ready:
+        await ensure_client(force=False)
+    if not client_ready:
+        return []
+    peer = parse_peer(chat_id)
+    msgs = []
+    try:
+        async for m in client.get_messages(peer, limit=limit):
+            sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
+            sid = getattr(sender, "id", None) or getattr(m, "sender_id", "") or ""
+            sname = (
+                getattr(sender, "first_name", None)
+                or getattr(sender, "title", None)
+                or getattr(sender, "username", None)
+                or str(sid)
+            )
+            txt = getattr(m, "text", None) or getattr(m, "caption", None) or ""
+            msgs.append({
+                "id": getattr(m, "id", 0),
+                "sender_id": str(sid),
+                "sender_name": str(sname),
+                "text": str(txt),
+            })
+    except Exception:
+        pass
+    return msgs
+
+
 async def run_job_worker(job):
-    started_at = time.time()
-    sent_in_burst = 0
     t_idx = 0
+    sent_burst = 0
     while job in jobs:
         if not job.get("running"):
             await asyncio.sleep(0.25)
@@ -243,8 +270,7 @@ async def run_job_worker(job):
         max_c = int(job.get("max_count") or 0)
         if max_c > 0 and (int(job.get("ok") or 0) + int(job.get("fail") or 0)) >= max_c:
             job["running"] = False
-            job["logs"].append(f"[{now_str()}] finished")
-            save_jobs()
+            save_json(JOBS_FILE, jobs)
             continue
 
         if not client_ready:
@@ -260,54 +286,93 @@ async def run_job_worker(job):
 
         raw_t = targets[t_idx % len(targets)]
         t_idx += 1
-        parsed = parse_target(raw_t)
-        peer = int(parsed) if parsed.lstrip("-").isdigit() else parsed
+        peer = parse_peer(raw_t)
 
         try:
-            mode = job.get("mode", "text")
-            payload = job.get("payload", "")
-            if mode == "link" and hasattr(client, "forward_messages"):
-                m = re.search(r"splus\.ir/c/(-?\d+)/(\d+)", payload)
-                if m:
-                    from_peer = int(f"-100{m.group(1)}") if not m.group(1).startswith("-") else int(m.group(1))
-                    msg_id = int(m.group(2))
-                    await asyncio.wait_for(client.forward_messages(peer, from_peer, [msg_id]), timeout=15)
-                else:
-                    await asyncio.wait_for(client.send_message(peer, payload), timeout=15)
+            mode = job.get("mode", "spam")
+            if mode == "forward_msg" and hasattr(client, "forward_messages"):
+                src_peer = parse_peer(job.get("source_chat"))
+                msg_id = int(job.get("msg_id") or 0)
+                await asyncio.wait_for(client.forward_messages(peer, src_peer, [msg_id]), timeout=15)
             else:
-                await asyncio.wait_for(client.send_message(peer, payload), timeout=15)
+                await asyncio.wait_for(client.send_message(peer, job.get("payload", "")), timeout=15)
 
             job["ok"] = int(job.get("ok") or 0) + 1
-            job["last"] = now_str()
-            job["elapsed"] = f"{int(time.time() - started_at)}s"
-            job["logs"].append(f"[{now_str()}] OK #{job['ok']} -> {raw_t}")
-            sent_in_burst += 1
+            job["logs"].append(f"[{now_str()}] OK -> {raw_t}")
+            sent_burst += 1
         except Exception as e:
             job["fail"] = int(job.get("fail") or 0) + 1
-            job["last"] = now_str()
-            job["elapsed"] = f"{int(time.time() - started_at)}s"
-            job["logs"].append(f"[{now_str()}] ERR -> {str(e)[:80]}")
+            job["logs"].append(f"[{now_str()}] ERR -> {str(e)[:75]}")
 
-        job["logs"] = job["logs"][-30:]
-        if (job["ok"] + job["fail"]) % 10 == 0:
-            save_jobs()
-
+        job["logs"] = job["logs"][-25:]
         rest_every = int(job.get("rest_every") or 0)
         rest_ms = int(job.get("rest_ms") or 0)
-        if rest_every > 0 and rest_ms > 0 and sent_in_burst >= rest_every:
-            sent_in_burst = 0
-            job["logs"].append(f"[{now_str()}] rest {rest_ms}ms")
+        if rest_every > 0 and rest_ms > 0 and sent_burst >= rest_every:
+            sent_burst = 0
             await asyncio.sleep(rest_ms / 1000.0)
             continue
 
-        speed_ms = max(50, int(job.get("speed_ms") or 1000))
-        if job.get("speed_mode") == "smart":
-            speed_ms = int(speed_ms * 1.25)
-        await asyncio.sleep(speed_ms / 1000.0)
+        await asyncio.sleep(max(50, int(job.get("speed_ms") or 500)) / 1000.0)
+
+
+async def offline_side_watcher():
+    # پایش سایدهای افلاینی بگیر بر اساس دقیقه
+    last_seen_map = {}
+    replied_marker = {}
+    while True:
+        await asyncio.sleep(10)
+        if not client_ready:
+            continue
+        for s in list(sides):
+            if s.get("enabled") is False:
+                continue
+            users = s.get("users") or []
+            chat_id = s.get("chat_id") or ""
+            reply_text = (s.get("reply_text") or "").strip()
+            minutes = max(1, int(s.get("minutes") or 3))
+            if not users or not chat_id or not reply_text:
+                continue
+
+            peer = parse_peer(chat_id)
+            target_ids = {str(u.get("id")) for u in users if u.get("id")}
+            now_ts = time.time()
+            latest_msg_id = None
+
+            try:
+                async for m in client.get_messages(peer, limit=15):
+                    mid = getattr(m, "id", None)
+                    if latest_msg_id is None and mid is not None:
+                        latest_msg_id = mid
+                    sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
+                    sid = str(getattr(sender, "id", None) or getattr(m, "sender_id", "") or "")
+                    if sid in target_ids:
+                        last_seen_map[(s["id"], sid)] = now_ts
+            except Exception:
+                continue
+
+            all_offline = True
+            for sid in target_ids:
+                seen_ts = last_seen_map.get((s["id"], sid))
+                if seen_ts is None:
+                    last_seen_map[(s["id"], sid)] = now_ts
+                    all_offline = False
+                elif (now_ts - seen_ts) < (minutes * 60):
+                    all_offline = False
+
+            if all_offline and latest_msg_id and replied_marker.get(s["id"]) != latest_msg_id:
+                try:
+                    await asyncio.wait_for(
+                        client.send_message(peer, reply_text, reply_to_message_id=latest_msg_id),
+                        timeout=15,
+                    )
+                    replied_marker[s["id"]] = latest_msg_id
+                except Exception:
+                    pass
 
 
 async def supervisor():
     active = {}
+    asyncio.create_task(offline_side_watcher())
     while True:
         ids = {j["id"] for j in jobs}
         for k in list(active.keys()):
@@ -349,8 +414,6 @@ def health():
 @app.route("/api/send_phone")
 def api_send_phone():
     phone = (request.args.get("phone") or "").strip()
-    if not phone:
-        return jsonify({"ok": False, "auth_msg": "شماره را وارد کنید."})
     fut = run_async(do_send_code(phone))
     if fut:
         try:
@@ -363,8 +426,6 @@ def api_send_phone():
 @app.route("/api/verify_code")
 def api_verify_code():
     code = (request.args.get("code") or "").strip()
-    if not code:
-        return jsonify({"ok": False, "auth_msg": "کد را وارد کنید."})
     fut = run_async(do_verify_code(code))
     if fut:
         try:
@@ -394,36 +455,48 @@ def api_groups():
     return jsonify(groups)
 
 
+@app.route("/api/recent_messages")
+def api_recent_messages():
+    chat_id = (request.args.get("chat_id") or "").strip()
+    limit = max(1, min(20, int(request.args.get("limit") or 5)))
+    fut = run_async(fetch_recent_messages(chat_id, limit=limit))
+    if fut:
+        try:
+            return jsonify(fut.result(timeout=18))
+        except Exception:
+            pass
+    return jsonify([])
+
+
 @app.route("/api/add_job")
 def api_add_job():
     global job_seq
-    mode = (request.args.get("mode") or "text").strip()
+    mode = (request.args.get("mode") or "spam").strip()
     payload = (request.args.get("payload") or "").strip()
     raw_targets = (request.args.get("targets") or "").strip()
     targets = [x.strip() for x in re.split(r"[,\n]+", raw_targets) if x.strip()]
-    if not payload or not targets:
-        return jsonify({"ok": False, "msg": "محتوا و مقصد را وارد کنید."})
+    if not targets or (mode != "forward_msg" and not payload):
+        return jsonify({"ok": False, "msg": "اطلاعات ناقص است."})
 
     job_seq += 1
     job = {
         "id": str(100 + job_seq),
         "mode": mode,
+        "source_chat": (request.args.get("source_chat") or "").strip(),
+        "msg_id": int(request.args.get("msg_id") or 0),
         "payload": payload,
         "targets": targets,
-        "speed_ms": max(50, int(request.args.get("speed_ms") or 1000)),
+        "speed_ms": max(50, int(request.args.get("speed_ms") or 500)),
         "max_count": max(0, int(request.args.get("max_count") or 0)),
-        "speed_mode": request.args.get("speed_mode") or "fixed",
         "rest_every": max(0, int(request.args.get("rest_every") or 0)),
         "rest_ms": max(0, int(request.args.get("rest_ms") or 0)),
         "running": True,
         "ok": 0,
         "fail": 0,
-        "last": "-",
-        "elapsed": "0s",
-        "logs": [f"[{now_str()}] loop starting..."],
+        "logs": [f"[{now_str()}] started ({mode})"],
     }
     jobs.append(job)
-    save_jobs()
+    save_json(JOBS_FILE, jobs)
     return jsonify({"ok": True, "msg": f"تسک #{job['id']} شروع شد."})
 
 
@@ -438,7 +511,52 @@ def api_job_ctrl():
             elif act == "delete":
                 jobs.remove(j)
             break
-    save_jobs()
+    save_json(JOBS_FILE, jobs)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/side_save")
+def api_side_save():
+    global side_seq
+    sid = (request.args.get("id") or "").strip()
+    name = (request.args.get("name") or "ساید").strip()
+    chat_id = (request.args.get("chat_id") or "").strip()
+    minutes = max(1, int(request.args.get("minutes") or 3))
+    reply_text = (request.args.get("reply_text") or "").strip()
+    enabled = (request.args.get("enabled") or "true").lower() == "true"
+    try:
+        users = json.loads(request.args.get("users") or "[]")
+    except Exception:
+        users = []
+
+    target_side = None
+    for s in sides:
+        if sid and s["id"] == sid:
+            target_side = s
+            break
+
+    if target_side is None:
+        side_seq += 1
+        target_side = {"id": f"side_{side_seq}_{int(time.time())}", "name": name}
+        sides.append(target_side)
+
+    target_side.update({
+        "name": name,
+        "chat_id": chat_id,
+        "minutes": minutes,
+        "reply_text": reply_text,
+        "enabled": enabled,
+        "users": users,
+    })
+    save_json(SIDES_FILE, sides)
+    return jsonify({"ok": True, "msg": "ساید ذخیره شد.", "side": target_side})
+
+
+@app.route("/api/side_delete")
+def api_side_delete():
+    sid = (request.args.get("id") or "").strip()
+    sides[:] = [s for s in sides if s["id"] != sid]
+    save_json(SIDES_FILE, sides)
     return jsonify({"ok": True})
 
 
@@ -458,10 +576,15 @@ def api_state():
         "accounts": accounts,
         "groups": groups,
         "jobs": jobs,
+        "sides": sides,
     })
 
 
-load_jobs()
+jobs[:] = load_json(JOBS_FILE, [])
+sides[:] = load_json(SIDES_FILE, [])
+job_seq = len(jobs)
+side_seq = len(sides)
+
 Thread(target=start_bot_thread, daemon=True).start()
 
 if __name__ == "__main__":
