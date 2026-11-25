@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -196,20 +197,20 @@ async def ensure_client(force=False):
 async def smart_heal_and_resume(job, err_msg):
     job["heal_state"] = "recovering"
     job["last_error"] = err_msg[:90]
-    job["logs"].append(f"[{now_str()}] HEAL -> خطا ثبت شد، تلاش برای بازیابی و ادامه دستور...")
+    job["logs"].append(f"[{now_str()}] HEAL -> تلاش برای بازیابی و ادامه دستور...")
     job["logs"] = job["logs"][-25:]
 
-    for attempt in range(1, 6):
+    for attempt in range(1, 5):
         if not job.get("running") or job not in jobs:
             return False
         ok = await ensure_client(force=True)
         if ok:
             job["heal_state"] = "resumed"
             job["last_error"] = ""
-            job["logs"].append(f"[{now_str()}] RESUMED -> اتصال برگشت، ادامه دستور {job.get('mode')}")
+            job["logs"].append(f"[{now_str()}] RESUMED -> ادامه دستور {job.get('mode')}")
             job["logs"] = job["logs"][-25:]
             return True
-        await asyncio.sleep(min(10, attempt * 2))
+        await asyncio.sleep(min(8, attempt * 2))
 
     return False
 
@@ -341,21 +342,80 @@ async def inspect_message_by_link(chat_id, link):
         return {"ok": False, "msg": f"خطا در بررسی لینک: {e}"}
 
 
+async def send_reply_compatible(peer, text, msg_id):
+    if not msg_id:
+        return await asyncio.wait_for(client.send_message(peer, text), timeout=15)
+
+    sig = None
+    try:
+        sig = inspect.signature(client.send_message)
+    except Exception:
+        sig = None
+
+    kw_candidates = []
+    if sig and sig.parameters:
+        params = list(sig.parameters.keys())
+        for cand in ("reply_to", "reply_to_msg_id", "reply_to_message_id", "reply_id", "message_id"):
+            if cand in params:
+                kw_candidates.append({cand: msg_id})
+    for cand in ("reply_to", "reply_to_msg_id", "reply_id"):
+        if not any(cand in d for d in kw_candidates):
+            kw_candidates.append({cand: msg_id})
+
+    last_err = None
+    for kw in kw_candidates:
+        try:
+            return await asyncio.wait_for(client.send_message(peer, text, **kw), timeout=15)
+        except TypeError as e:
+            last_err = e
+            continue
+
+    # اگر هیچ نام آرگومان ریپلای در send_message پشتیبانی نشد، ارسال عادی انجام شود تا تسک خطا ندهد
+    return await asyncio.wait_for(client.send_message(peer, text), timeout=15)
+
+
+async def forward_msg_compatible(dst_peer, src_peer, msg_id, fallback_text=""):
+    fwd_fn = getattr(client, "forward_messages", None) or getattr(client, "forward_message", None)
+    last_err = None
+
+    if callable(fwd_fn):
+        attempts = [
+            lambda: fwd_fn(src_peer, [msg_id], dst_peer),
+            lambda: fwd_fn(dst_peer, [msg_id], src_peer),
+            lambda: fwd_fn(src_peer, msg_id, dst_peer),
+            lambda: fwd_fn(dst_peer, msg_id, src_peer),
+            lambda: fwd_fn(from_peer=src_peer, message_ids=[msg_id], to_peer=dst_peer),
+            lambda: fwd_fn(chat_id=dst_peer, from_chat_id=src_peer, message_id=msg_id),
+        ]
+        for fn in attempts:
+            try:
+                res = fn()
+                if asyncio.iscoroutine(res):
+                    return await asyncio.wait_for(res, timeout=15)
+                return res
+            except TypeError as e:
+                last_err = e
+                continue
+            except Exception as e:
+                last_err = e
+                if "cannot cast list to any kind of peer" in str(e).lower():
+                    continue
+                raise
+
+    if fallback_text:
+        return await asyncio.wait_for(client.send_message(dst_peer, fallback_text), timeout=15)
+    raise last_err or RuntimeError("امکان فوروارد پیام وجود نداشت.")
+
+
 async def execute_single_step(job, peer, raw_t):
     mode = job.get("mode", "spam")
     if mode == "forward_msg":
         src_peer = parse_peer(job.get("source_chat"))
         msg_id = int(job.get("msg_id") or 0)
-        if hasattr(client, "forward_messages"):
-            await asyncio.wait_for(client.forward_messages(peer, src_peer, [msg_id]), timeout=15)
-        else:
-            await asyncio.wait_for(client.send_message(peer, job.get("payload", "")), timeout=15)
+        await forward_msg_compatible(peer, src_peer, msg_id, fallback_text=job.get("payload", ""))
     elif mode == "reply_loop":
         msg_id = int(job.get("msg_id") or 0)
-        await asyncio.wait_for(
-            client.send_message(peer, job.get("payload", ""), reply_to_message_id=msg_id),
-            timeout=15,
-        )
+        await send_reply_compatible(peer, job.get("payload", ""), msg_id)
     else:
         await asyncio.wait_for(client.send_message(peer, job.get("payload", "")), timeout=15)
 
@@ -403,7 +463,6 @@ async def run_job_worker(job):
             job["fail"] = int(job.get("fail") or 0) + 1
             job["logs"].append(f"[{now_str()}] ERR -> {err_txt[:80]}")
 
-            # خطایاب هوشمند: تلاش برای بازیابی و ادامه همان دستور قبلی
             resumed = await smart_heal_and_resume(job, err_txt)
             if resumed and job.get("running"):
                 try:
@@ -424,7 +483,6 @@ async def run_job_worker(job):
 
 
 async def background_connection_guard():
-    # نگهبان پس‌زمینه برای حفظ اتصال و ادامه تسک‌های فعال بعد از ری‌استارت
     while True:
         await asyncio.sleep(8)
         has_active = any(j.get("running") for j in jobs)
