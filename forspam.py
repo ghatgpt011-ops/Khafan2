@@ -100,60 +100,17 @@ def load_jobs():
             pass
 
 
-def parse_splus_link(link):
-    raw = str(link or "").strip()
-    if not raw:
-        return None, None, False
-
-    is_splus = ("splus.ir" in raw.lower()) or ("soroush" in raw.lower())
-    url_str = raw if raw.startswith(("http://", "https://")) else "https://" + raw
-    parsed = urlparse(url_str)
-    parts = [p for p in parsed.path.split("/") if p]
-
-    chat_id = None
-    msg_id = None
-
-    # حالت استاندارد سروش: splus.ir/c/<chat_id>/<msg_id>
-    if len(parts) >= 3 and parts[0].lower() == "c":
-        c_raw = parts[1].lstrip("-")
-        if c_raw.isdigit():
-            chat_id = int(f"-100{c_raw}") if len(c_raw) >= 6 else int(f"-{c_raw}")
-        if parts[2].isdigit():
-            msg_id = int(parts[2])
-
-    # حالت splus.ir/<username_or_chat>/<msg_id>
-    elif len(parts) >= 2 and parts[-1].isdigit():
-        msg_id = int(parts[-1])
-        cand = parts[-2]
-        if cand.lower() != "c":
-            chat_id = int(cand) if cand.lstrip("-").isdigit() else cand.lstrip("@")
-
-    # حالت splus.ir/m/<msg_id> یا لینک‌های کوتاه‌تر
-    elif len(parts) >= 1 and parts[-1].isdigit():
-        msg_id = int(parts[-1])
-
-    # اگر در query یا انتهای متن عدد پیام بود
-    if msg_id is None:
-        m = re.search(r"(?:/|=)(\d{1,15})(?:[/?#&]|$)", raw)
-        if m:
-            msg_id = int(m.group(1))
-        elif raw.isdigit():
-            msg_id = int(raw)
-            is_splus = True
-
-    if "splus.ir" in parsed.netloc.lower() or "splus.ir" in raw.lower():
-        is_splus = True
-
-    return chat_id, msg_id, is_splus
-
-
 def parse_peer(raw):
     s = str(raw or "").strip()
     if not s:
         return ""
-    chat_id, _, is_splus = parse_splus_link(s)
-    if is_splus and chat_id is not None:
-        return chat_id
+    if "splus.ir" in s or s.startswith("http"):
+        u = s if s.startswith("http") else "https://" + s
+        parts = [p for p in urlparse(u).path.split("/") if p]
+        if parts:
+            if parts[0] == "c" and len(parts) >= 2:
+                return int(f"-100{parts[1]}") if not parts[1].startswith("-") else int(parts[1])
+            return parts[0]
     if s.startswith("@"):
         s = s[1:]
     return int(s) if s.lstrip("-").isdigit() else s
@@ -189,7 +146,7 @@ async def resolve_target_entity(raw_peer):
     return parse_peer(raw_peer)
 
 
-def serialize_msg(m, chat_id="", msg_id_fallback=0):
+def serialize_msg(m, chat_id=""):
     sender = getattr(m, "from_user", None) or getattr(m, "sender_chat", None)
     sid = getattr(sender, "id", None) or getattr(m, "sender_id", "") or ""
     sname = (
@@ -199,13 +156,14 @@ def serialize_msg(m, chat_id="", msg_id_fallback=0):
         or str(sid)
     )
     txt = getattr(m, "text", None) or getattr(m, "caption", None) or getattr(m, "message", None) or ""
-    mid = getattr(m, "id", None)
+    if not txt and getattr(m, "media", None):
+        txt = "[پیام رسانه‌ای / فایل]"
     return {
-        "id": int(mid) if mid is not None else int(msg_id_fallback),
-        "chat_id": str(chat_id or ""),
+        "id": getattr(m, "id", 0),
+        "chat_id": str(chat_id),
         "sender_id": str(sid),
-        "sender_name": str(sname or "سروش"),
-        "text": str(txt or ""),
+        "sender_name": str(sname or "کاربر"),
+        "text": str(txt or "[بدون متن]"),
     }
 
 
@@ -359,61 +317,40 @@ async def refresh_groups():
         pass
 
 
-async def _scan_msgs_for_id(res, mid, chat_label):
-    if asyncio.iscoroutine(res):
-        res = await res
-    if hasattr(res, "__aiter__"):
-        async for m in res:
-            if int(getattr(m, "id", 0) or 0) == mid:
-                return serialize_msg(m, chat_label, mid)
-    elif isinstance(res, (list, tuple)):
-        for m in res:
-            if m and int(getattr(m, "id", 0) or 0) == mid:
-                return serialize_msg(m, chat_label, mid)
-    elif res and int(getattr(res, "id", 0) or 0) == mid:
-        return serialize_msg(res, chat_label, mid)
-    return None
-
-
-async def inspect_message_from_link(link):
-    chat_part, mid, is_splus = parse_splus_link(link)
-    if mid is None:
-        return {"ok": False, "msg": "لینک سروش معتبر نیست یا شماره پیام در آن پیدا نشد."}
-
+async def fetch_recent_messages(chat_id, limit=10):
     if not client_ready:
         await ensure_client(force=False)
+    if not client_ready:
+        return {"ok": False, "msg": "اکانت متصل نیست.", "messages": []}
 
-    if client_ready:
-        peers_to_try = candidate_peers_for_chat(chat_part)
-        if not peers_to_try:
-            peers_to_try = [g["id"] for g in groups[:15]]
-
-        for p in peers_to_try:
+    last_err = None
+    for p in candidate_peers_for_chat(chat_id):
+        ent = await resolve_target_entity(p)
+        for target in (ent, p):
             try:
-                ent = await resolve_target_entity(p)
-                for target in (ent, p):
-                    for fn_kwargs in ({"ids": [mid]}, {"ids": mid}, {"limit": 20}):
-                        try:
-                            res = client.get_messages(target, **fn_kwargs)
-                            found = await _scan_msgs_for_id(res, mid, str(chat_part or p))
-                            if found:
-                                return {"ok": True, "message": found}
-                        except Exception:
-                            continue
-            except Exception:
+                res = client.get_messages(target, limit=limit)
+                if asyncio.iscoroutine(res):
+                    res = await res
+                out = []
+                if hasattr(res, "__aiter__"):
+                    async for m in res:
+                        if m:
+                            out.append(serialize_msg(m, str(chat_id)))
+                        if len(out) >= limit:
+                            break
+                elif isinstance(res, (list, tuple)):
+                    for m in res:
+                        if m:
+                            out.append(serialize_msg(m, str(chat_id)))
+                        if len(out) >= limit:
+                            break
+                if out:
+                    return {"ok": True, "messages": out[:limit]}
+            except Exception as e:
+                last_err = e
                 continue
 
-    # حتی اگر کلاینت نتوانست پیام را از سرور بخواند، لینک سروش و شماره پیام را شناسایی می‌کند
-    platform_label = "سروش (splus.ir)" if is_splus else "پیام سروش"
-    return {
-        "ok": True,
-        "message": {
-            "id": int(mid),
-            "chat_id": str(chat_part or ""),
-            "sender_name": platform_label,
-            "text": f"لینک سروش شناسایی شد — شماره پیام: #{mid}",
-        },
-    }
+    return {"ok": False, "msg": f"دریافت پیام‌های اخیر ناموفق بود: {last_err or 'پیامی یافت نشد'}", "messages": []}
 
 
 async def send_reply_compatible(peer, text, msg_id):
@@ -636,27 +573,19 @@ def api_groups():
     return jsonify(groups)
 
 
-@app.route("/api/inspect_link")
-def api_inspect_link():
-    link = (request.args.get("link") or "").strip()
-    fut = run_async(inspect_message_from_link(link))
+@app.route("/api/recent_messages")
+def api_recent_messages():
+    chat_id = (request.args.get("chat_id") or "").strip()
+    limit = max(1, min(10, int(request.args.get("limit") or 10)))
+    if not chat_id:
+        return jsonify({"ok": False, "msg": "ابتدا مبدا را انتخاب کنید.", "messages": []})
+    fut = run_async(fetch_recent_messages(chat_id, limit=limit))
     if fut:
         try:
             return jsonify(fut.result(timeout=20))
-        except Exception:
-            pass
-    chat_part, mid, _ = parse_splus_link(link)
-    if mid is not None:
-        return jsonify({
-            "ok": True,
-            "message": {
-                "id": int(mid),
-                "chat_id": str(chat_part or ""),
-                "sender_name": "سروش",
-                "text": f"لینک سروش شناسایی شد — شماره پیام: #{mid}",
-            },
-        })
-    return jsonify({"ok": False, "msg": "لینک سروش تشخیص داده نشد."})
+        except Exception as e:
+            return jsonify({"ok": False, "msg": f"خطا: {e}", "messages": []})
+    return jsonify({"ok": False, "msg": "سرویس پیام آماده نیست.", "messages": []})
 
 
 @app.route("/api/add_job")
