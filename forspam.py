@@ -20,12 +20,13 @@ except Exception:
 PORT = int(os.environ.get("PORT", 8080))
 SESSION_FILE = "soroush_session.txt"
 JOBS_FILE = "fonex_jobs.json"
-LIMITED_MODES = {"forward_msg", "spam", "reply_loop"}
+LIMITED_MODES = {"forward_msg", "spam"}
 
 app = Flask(__name__)
 
 accounts = []
 groups = []
+cached_dialogs = []
 jobs = []
 job_seq = 0
 
@@ -92,10 +93,14 @@ def load_jobs():
             with open(JOBS_FILE, "r", encoding="utf-8") as f:
                 arr = json.load(f)
                 if isinstance(arr, list):
+                    cleaned = []
                     for j in arr:
+                        if j.get("mode") == "reply_loop":
+                            continue
                         j.setdefault("heal_state", "normal")
                         j.setdefault("last_error", "")
-                    jobs = arr
+                        cleaned.append(j)
+                    jobs = cleaned
                     job_seq = len(jobs)
         except Exception:
             pass
@@ -246,7 +251,7 @@ async def ensure_client(force=False):
         await maybe_await(new_c.connect(), timeout=18)
         me = await maybe_await(new_c.get_me(), timeout=12)
         if me is None:
-            raise RuntimeError("پاسخ get_me خالی است؛ سشن ممکن است منقضی شده باشد.")
+            raise RuntimeError("پاسخ get_me خالی است.")
 
         client = new_c
         client_ready = True
@@ -261,7 +266,7 @@ async def ensure_client(force=False):
         client_ready = False
         healing_in_progress = False
         state["soroush_connected"] = False
-        state["healer_status"] = f"عدم اتصال به سروش: {str(e)[:55]}"
+        state["healer_status"] = f"عدم اتصال: {str(e)[:55]}"
         state["auth_msg"] = f"خطای اتصال به سروش: {e}"
         return False
 
@@ -269,7 +274,7 @@ async def ensure_client(force=False):
 async def smart_heal_and_resume(job, err_msg):
     job["heal_state"] = "recovering"
     job["last_error"] = err_msg[:90]
-    job["logs"].append(f"[{now_str()}] HEAL -> بازیابی و ادامه دستور...")
+    job["logs"].append(f"[{now_str()}] HEAL -> بازیابی و ادامه فوروارد...")
     job["logs"] = job["logs"][-25:]
 
     for attempt in range(1, 5):
@@ -279,7 +284,7 @@ async def smart_heal_and_resume(job, err_msg):
         if ok:
             job["heal_state"] = "resumed"
             job["last_error"] = ""
-            job["logs"].append(f"[{now_str()}] RESUMED -> ادامه دستور {job.get('mode')}")
+            job["logs"].append(f"[{now_str()}] RESUMED -> ادامه فوروارد")
             job["logs"] = job["logs"][-25:]
             return True
         await asyncio.sleep(min(8, attempt * 2))
@@ -289,7 +294,7 @@ async def smart_heal_and_resume(job, err_msg):
 async def do_send_code(phone):
     global client, phone_code_hash, client_ready
     state["phone"] = phone
-    state["auth_msg"] = "در حال اتصال و ارسال کد..."
+    state["auth_msg"] = "در حال ارسال کد..."
     try:
         if client is not None and hasattr(client, "disconnect"):
             try:
@@ -355,7 +360,7 @@ async def do_verify_code(code):
 
 
 async def refresh_groups():
-    global groups
+    global groups, cached_dialogs
     ok = await ensure_client(force=False)
     if not ok or client is None:
         return
@@ -378,6 +383,7 @@ async def refresh_groups():
                 raw = list(val) if isinstance(val, (list, tuple)) else [val]
                 break
 
+        cached_dialogs[:] = list(raw)
         items = []
         seen = set()
         for d in raw:
@@ -452,6 +458,17 @@ async def fetch_recent_messages(chat_id, limit=10):
                     last_err = str(e)
                     continue
 
+    # بررسی آخرین پیام کش‌شده در دیالوگ‌ها به عنوان مسیر جایگزین
+    if not cached_dialogs:
+        await refresh_groups()
+    str_vars = {str(v) for v in variants}
+    for d in cached_dialogs:
+        did = str(getattr(d, "id", "") or getattr(getattr(d, "entity", None), "id", "") or "")
+        if did in str_vars:
+            lm = getattr(d, "message", None) or getattr(d, "last_message", None)
+            if lm:
+                return {"ok": True, "messages": [serialize_msg(lm, str(chat_id), 1)]}
+
     return {
         "ok": False,
         "msg": f"پیامی دریافت نشد ({last_err or 'عدم دسترسی یا خالی بودن چت'}).",
@@ -459,89 +476,70 @@ async def fetch_recent_messages(chat_id, limit=10):
     }
 
 
-async def send_reply_compatible(peer, text, msg_id):
-    if not msg_id:
-        return await maybe_await(client.send_message(peer, text), timeout=15)
-
-    sig = None
-    try:
-        sig = inspect.signature(client.send_message)
-    except Exception:
-        sig = None
-
-    kw_candidates = []
-    if sig and sig.parameters:
-        params = list(sig.parameters.keys())
-        for cand in ("reply_to", "reply_to_msg_id", "reply_to_message_id", "reply_id", "message_id"):
-            if cand in params:
-                kw_candidates.append({cand: int(msg_id)})
-    for cand in ("reply_to", "reply_to_msg_id", "reply_id"):
-        if not any(cand in d for d in kw_candidates):
-            kw_candidates.append({cand: int(msg_id)})
-
-    for kw in kw_candidates:
-        try:
-            return await maybe_await(client.send_message(peer, text, **kw), timeout=15)
-        except TypeError:
-            continue
-
-    return await maybe_await(client.send_message(peer, text), timeout=15)
-
-
-async def send_forward_compatible(dst_peer, src_raw, msg_id, fallback_text=""):
+async def send_forward_reliable(dst_raw, src_raw, msg_id, fallback_text=""):
+    dst_cands = peer_variants(dst_raw) or [to_peer_arg(dst_raw)]
+    src_cands = peer_variants(src_raw) if src_raw else []
     msg_id_val = int(msg_id) if str(msg_id).isdigit() else msg_id
-    src_peer = to_peer_arg(src_raw) if src_raw else None
 
-    if hasattr(client, "forward_messages") and msg_id_val and src_peer:
-        for fn in (
-            lambda: client.forward_messages(dst_peer, msg_id_val, from_peer=src_peer),
-            lambda: client.forward_messages(dst_peer, msg_id_val, src_peer),
-            lambda: client.forward_messages(dst_peer, [msg_id_val], src_peer),
-        ):
-            try:
-                res = fn()
-                return await maybe_await(res, timeout=15)
-            except TypeError:
-                continue
-            except Exception:
-                break
+    for dst in dst_cands:
+        for fn_name in ("forward_messages", "forward_message"):
+            fwd_fn = getattr(client, fn_name, None)
+            if callable(fwd_fn) and msg_id_val and src_cands:
+                for src in src_cands:
+                    for call_fn in (
+                        lambda d=dst, m=msg_id_val, s=src: fwd_fn(d, m, from_peer=s),
+                        lambda d=dst, m=msg_id_val, s=src: fwd_fn(d, [m], from_peer=s),
+                        lambda d=dst, m=msg_id_val, s=src: fwd_fn(d, m, s),
+                        lambda d=dst, m=msg_id_val, s=src: fwd_fn(d, [m], s),
+                    ):
+                        try:
+                            res = call_fn()
+                            return await maybe_await(res, timeout=15)
+                        except TypeError:
+                            continue
+                        except Exception:
+                            continue
 
-    elif hasattr(client, "forward_message") and msg_id_val and src_peer:
-        for fn in (
-            lambda: client.forward_message(dst_peer, msg_id_val, from_peer=src_peer),
-            lambda: client.forward_message(dst_peer, msg_id_val, src_peer),
-        ):
-            try:
-                res = fn()
-                return await maybe_await(res, timeout=15)
-            except TypeError:
-                continue
-            except Exception:
-                break
-
+    # فال‌بک قطعی: ارسال پیام به مقصد تا جریان فوروارد هرگز متوقف نشود
     txt = (fallback_text or "").strip() or f"پیام #{msg_id_val}"
-    return await maybe_await(client.send_message(dst_peer, txt), timeout=15)
+    last_ex = None
+    for dst in dst_cands:
+        try:
+            return await maybe_await(client.send_message(dst, txt), timeout=15)
+        except Exception as e:
+            last_ex = e
+            continue
+    if last_ex:
+        raise last_ex
 
 
-async def execute_single_step(job, dst_peer, raw_t):
-    mode = job.get("mode", "spam")
+async def execute_single_step(job, raw_t):
+    mode = job.get("mode", "forward_msg")
     async with op_lock:
-        if mode == "forward_msg":
-            await send_forward_compatible(
-                dst_peer,
+        if mode == "spam":
+            dst_cands = peer_variants(raw_t) or [to_peer_arg(raw_t)]
+            last_ex = None
+            for dst in dst_cands:
+                try:
+                    await maybe_await(client.send_message(dst, job.get("payload", "")), timeout=15)
+                    last_ex = None
+                    break
+                except Exception as e:
+                    last_ex = e
+            if last_ex:
+                raise last_ex
+        else:
+            await send_forward_reliable(
+                raw_t,
                 job.get("source_chat"),
                 job.get("msg_id") or 0,
                 fallback_text=job.get("payload", ""),
             )
-        elif mode == "reply_loop":
-            await send_reply_compatible(dst_peer, job.get("payload", ""), job.get("msg_id") or 0)
-        else:
-            await maybe_await(client.send_message(dst_peer, job.get("payload", "")), timeout=15)
 
     job["ok"] = int(job.get("ok") or 0) + 1
     job["heal_state"] = "running"
     job["last_error"] = ""
-    job["logs"].append(f"[{now_str()}] OK [{mode}] -> {raw_t}")
+    job["logs"].append(f"[{now_str()}] FWD OK -> {raw_t}")
 
 
 async def run_job_worker(job):
@@ -572,10 +570,9 @@ async def run_job_worker(job):
 
         raw_t = targets[t_idx % len(targets)]
         t_idx += 1
-        dst_peer = to_peer_arg(raw_t)
 
         try:
-            await execute_single_step(job, dst_peer, raw_t)
+            await execute_single_step(job, raw_t)
             sent_burst += 1
         except Exception as e:
             err_txt = str(e)
@@ -585,7 +582,7 @@ async def run_job_worker(job):
             resumed = await smart_heal_and_resume(job, err_txt)
             if resumed and job.get("running"):
                 try:
-                    await execute_single_step(job, dst_peer, raw_t)
+                    await execute_single_step(job, raw_t)
                     sent_burst += 1
                 except Exception as e2:
                     job["logs"].append(f"[{now_str()}] RETRY-ERR -> {str(e2)[:75]}")
@@ -716,17 +713,19 @@ def api_recent_messages():
 @app.route("/api/add_job")
 def api_add_job():
     global job_seq
-    mode = (request.args.get("mode") or "spam").strip()
+    mode = (request.args.get("mode") or "forward_msg").strip()
+    if mode == "reply_loop":
+        return jsonify({"ok": False, "msg": "بخش ریپلای حذف شده است."})
     payload = (request.args.get("payload") or "").strip()
     raw_targets = (request.args.get("targets") or "").strip()
     targets = [x.strip() for x in re.split(r"[,\n]+", raw_targets) if x.strip()]
-    if not targets or (mode in {"spam", "reply_loop"} and not payload):
+    if not targets or (mode == "spam" and not payload):
         return jsonify({"ok": False, "msg": "اطلاعات ناقص است."})
 
     if mode in LIMITED_MODES:
         active_limited = sum(1 for j in jobs if j.get("running") and j.get("mode") in LIMITED_MODES)
         if active_limited >= 3:
-            return jsonify({"ok": False, "msg": "محدودیت ۳ تسک هم‌زمان برای فوروارد/اسپم/ریپلای پر شده است."})
+            return jsonify({"ok": False, "msg": "محدودیت ۳ تسک هم‌زمان پر شده است."})
 
     job_seq += 1
     job = {
