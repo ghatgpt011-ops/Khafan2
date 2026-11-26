@@ -24,6 +24,8 @@ except Exception:
 PORT = int(os.environ.get("PORT", 8080))
 SESSIONS_FILE = "soroush_sessions.json"
 JOBS_FILE = "fonex_jobs.json"
+ENEMIES_FILE = "fonex_enemies.json"
+GROUPS_CACHE_FILE = "fonex_groups_cache.json"
 MAX_ACTIVE_JOBS = 3
 MAX_TARGETS_PER_JOB = 3
 
@@ -58,6 +60,8 @@ pending_auth_by_acc = {}
 
 job_seq = 0
 enemy_seq = 0
+last_panel_visit_ts = 0.0
+_refreshing_keys = set()
 
 state = {
     "ping": "12 ms",
@@ -221,6 +225,51 @@ def load_jobs():
     return cleaned
 
 
+def save_enemies():
+    try:
+        with open(ENEMIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(enemy_rules, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def load_enemies():
+    global enemy_seq
+    cleaned = []
+    if os.path.exists(ENEMIES_FILE):
+        try:
+            with open(ENEMIES_FILE, "r", encoding="utf-8") as f:
+                arr = json.load(f)
+                if isinstance(arr, list):
+                    for er in arr:
+                        if isinstance(er, dict):
+                            cleaned.append(er)
+        except Exception:
+            cleaned = []
+    enemy_seq = len(cleaned)
+    return cleaned
+
+
+def save_groups_cache():
+    try:
+        with open(GROUPS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(groups_by_acc, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def load_groups_cache():
+    if os.path.exists(GROUPS_CACHE_FILE):
+        try:
+            with open(GROUPS_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
 def normalize_numeric_id(raw_num):
     s = str(raw_num or "").strip().replace("\u200f", "").replace("\u200e", "")
     if s.endswith("-") and s[:-1].isdigit():
@@ -228,7 +277,6 @@ def normalize_numeric_id(raw_num):
     digits = s.lstrip("-")
     if not digits.isdigit():
         return s
-    # اگر به صورت 100... شروع شده بود، 100 ابتدایی را جدا می‌کنیم
     if digits.startswith("100") and len(digits) > 5:
         base_id = digits[3:]
         return f"-100{base_id}"
@@ -409,12 +457,16 @@ def mark_account_kicked(acc_key, reason="اکانت از سشن خارج شد.")
             j["last_error"] = "خروج از اکانت"
             add_log(j, "KICKED -> متوقف شد (خروج از اکانت)")
             changed = True
+    enemy_changed = False
     for er in enemy_rules:
         if er.get("acc_key") == acc_key and er.get("running"):
             er["running"] = False
             er["status"] = "خروج از اکانت"
+            enemy_changed = True
     if changed:
         save_jobs()
+    if enemy_changed:
+        save_enemies()
 
     if acc_key == active_acc_key:
         state["soroush_connected"] = False
@@ -443,28 +495,44 @@ def run_async(coro):
         return asyncio.run_coroutine_threadsafe(coro, bot_loop)
 
 
-async def refresh_groups(acc_key=""):
-    target_key = resolve_acc_key(acc_key)
-    if not await check_acc_alive(target_key):
-        return groups_by_acc.get(target_key, [])
-    c = get_acc_client(target_key)
+def schedule_bg(coro):
     try:
-        if hasattr(c, "get_dialogs"):
-            dialogs = await maybe_await(c.get_dialogs(limit=100), timeout=6)
-            items = []
-            seen = set()
-            for d in list(dialogs or []):
-                did = str(getattr(d, "id", "") or "")
-                if not did or did in seen:
-                    continue
-                seen.add(did)
-                name = getattr(d, "name", None) or getattr(d, "title", None) or did
-                items.append({"id": did, "name": str(name)})
-            if items:
-                groups_by_acc[target_key] = items
+        fut = run_async(coro)
+        return fut
+    except Exception:
+        return None
+
+
+async def refresh_groups(acc_key="", force_alive=True):
+    target_key = resolve_acc_key(acc_key)
+    if target_key in _refreshing_keys:
+        return groups_by_acc.get(target_key, [])
+    _refreshing_keys.add(target_key)
+    try:
+        if force_alive:
+            if not await check_acc_alive(target_key):
+                return groups_by_acc.get(target_key, [])
+        c = get_acc_client(target_key)
+        if not c or not hasattr(c, "get_dialogs"):
+            return groups_by_acc.get(target_key, [])
+        dialogs = await maybe_await(c.get_dialogs(limit=100), timeout=6)
+        items = []
+        seen = set()
+        for d in list(dialogs or []):
+            did = str(getattr(d, "id", "") or "")
+            if not did or did in seen:
+                continue
+            seen.add(did)
+            name = getattr(d, "name", None) or getattr(d, "title", None) or did
+            items.append({"id": did, "name": str(name)})
+        if items:
+            groups_by_acc[target_key] = items
+            save_groups_cache()
     except Exception as e:
         if is_kicked_error(e):
             mark_account_kicked(target_key, str(e)[:80])
+    finally:
+        _refreshing_keys.discard(target_key)
     return groups_by_acc.get(target_key, [])
 
 
@@ -503,7 +571,7 @@ async def connect_single_account(acc_obj, force_new=False):
             state["soroush_connected"] = bool(sess)
             state["healer_status"] = "متصل به سروش" if sess else "در انتظار ورود"
         if sess:
-            asyncio.create_task(refresh_groups(acc_key))
+            asyncio.create_task(refresh_groups(acc_key, force_alive=False))
         return True
     except Exception as e:
         if is_kicked_error(e):
@@ -511,9 +579,18 @@ async def connect_single_account(acc_obj, force_new=False):
         return False
 
 
+async def ensure_accounts_connected():
+    for a in list(accounts):
+        if a.get("session") and not a.get("kicked") and not is_acc_ready(a["key"]):
+            await connect_single_account(a)
+
+
 async def check_acc_alive(acc_key):
     c = get_acc_client(acc_key)
     if not is_acc_ready(acc_key) or c is None:
+        acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
+        if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+            return await connect_single_account(acc_obj)
         return False
     if not hasattr(c, "get_me"):
         return True
@@ -646,7 +723,7 @@ async def do_verify_code(code):
         state["soroush_connected"] = True
         state["healer_status"] = "متصل به سروش"
         state["auth_msg"] = f"اکانت {name} متصل شد."
-        asyncio.create_task(refresh_groups(acc_key))
+        asyncio.create_task(refresh_groups(acc_key, force_alive=False))
     except Exception as e:
         state["auth_msg"] = f"خطا در تأیید کد: {e}"
 
@@ -792,7 +869,6 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
                 if is_kicked_error(e):
                     raise
                 break
-        # اگر reply_to خطا داد، ارسال ساده روی همان peer انجام شود تا تسک کرش نکند
         try:
             await maybe_await(c.send_message(peer, text_payload), timeout=7)
             return None
@@ -822,7 +898,6 @@ async def execute_job_step(job, raw_target):
             raise ValueError("شناسه پیام ریپلای مشخص نیست.")
         if not payload.strip():
             raise ValueError("متن ریپلای خالی است.")
-        # تلاش برای یافتن پیام در چت تا peer دقیق‌تر شود
         found_cands, _ = await find_channel_in_dialogs(acc_key, raw_target)
         merged_peers = []
         for x in (found_cands + dst_cands):
@@ -1009,6 +1084,7 @@ async def poll_enemy_rules():
         if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
             er["running"] = False
             er["status"] = "تکمیل شد"
+            save_enemies()
             continue
 
         peers = peer_candidates(er.get("chat_id"))
@@ -1047,6 +1123,8 @@ async def poll_enemy_rules():
                                 if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
                                     er["running"] = False
                                     er["status"] = "تکمیل شد"
+                                save_enemies()
+                                if not er.get("running"):
                                     break
                             except Exception as e:
                                 er["last_error"] = str(e)[:70]
@@ -1058,14 +1136,15 @@ async def poll_enemy_rules():
 
 async def watcher_loop():
     tick = 0
-    for a in list(accounts):
-        await connect_single_account(a)
+    await ensure_accounts_connected()
 
     while True:
         await asyncio.sleep(0.35)
         tick += 1
         await poll_enemy_rules()
-        if tick % 30 == 0:
+        if tick % 20 == 0:
+            await ensure_accounts_connected()
+        if tick % 35 == 0:
             for a in list(accounts):
                 await check_acc_alive(a["key"])
 
@@ -1106,6 +1185,18 @@ def start_bot_thread():
 @app.route("/health")
 def health():
     return "OK", 200
+
+
+@app.route("/api/hello")
+def api_hello():
+    global last_panel_visit_ts
+    last_panel_visit_ts = time.time()
+    cur_key = resolve_acc_key(request.args.get("acc_key") or "")
+    if cur_key and not is_acc_ready(cur_key):
+        schedule_bg(ensure_accounts_connected())
+    if cur_key and not groups_by_acc.get(cur_key):
+        schedule_bg(refresh_groups(cur_key, force_alive=True))
+    return jsonify({"ok": True, "returning": True, "active_acc_key": cur_key})
 
 
 @app.route("/api/send_phone")
@@ -1166,9 +1257,11 @@ def api_del_account():
         rkey = removed["key"]
         clients_by_acc.pop(rkey, None)
         groups_by_acc.pop(rkey, None)
+        save_groups_cache()
         jobs[:] = [j for j in jobs if j.get("acc_key") != rkey]
         enemy_rules[:] = [e for e in enemy_rules if e.get("acc_key") != rkey]
         save_jobs()
+        save_enemies()
     active_acc_key = accounts[0]["key"] if accounts else ""
     save_sessions()
     state["soroush_connected"] = is_acc_ready(active_acc_key) if active_acc_key else False
@@ -1267,6 +1360,7 @@ def api_add_enemy():
         "running": True,
     }
     enemy_rules.append(er)
+    save_enemies()
     return jsonify({"ok": True, "msg": f"دشمن «{user_name}» برای اکانت {get_acc_label(acc_key)} ثبت شد."})
 
 
@@ -1284,6 +1378,7 @@ def api_enemy_ctrl():
             elif act == "delete":
                 enemy_rules.remove(er)
             break
+    save_enemies()
     return jsonify({"ok": True})
 
 
@@ -1379,6 +1474,9 @@ def api_job_ctrl():
 
 @app.route("/api/state")
 def api_state():
+    global last_panel_visit_ts
+    last_panel_visit_ts = time.time()
+
     if psutil:
         try:
             state["cpu"] = str(int(psutil.cpu_percent(interval=None)))
@@ -1391,6 +1489,11 @@ def api_state():
     cur_ready = is_acc_ready(cur_key) if cur_key else False
     cur_kicked = bool(cur_acc.get("kicked")) if cur_acc else False
     cur_groups = groups_by_acc.get(cur_key, [])
+
+    if cur_key and not cur_ready and not cur_kicked:
+        schedule_bg(ensure_accounts_connected())
+    if cur_key and not cur_groups and cur_ready:
+        schedule_bg(refresh_groups(cur_key, force_alive=False))
 
     acc_list_out = [
         {
@@ -1421,8 +1524,11 @@ def api_state():
 
 
 accounts[:] = load_sessions()
+groups_by_acc.update(load_groups_cache())
 loaded_jobs = load_jobs()
 jobs[:] = loaded_jobs if isinstance(loaded_jobs, list) else []
+loaded_enemies = load_enemies()
+enemy_rules[:] = loaded_enemies if isinstance(loaded_enemies, list) else []
 
 Thread(target=start_bot_thread, daemon=True).start()
 
