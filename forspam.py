@@ -60,6 +60,7 @@ pending_auth_by_acc = {}
 
 job_seq = 0
 enemy_seq = 0
+event_seq = 1
 last_panel_visit_ts = 0.0
 _refreshing_keys = set()
 
@@ -72,6 +73,7 @@ state = {
     "healer_status": "آماده",
     "soroush_connected": False,
     "kicked_out": False,
+    "event_notice": "",
 }
 
 bot_loop = None
@@ -88,6 +90,14 @@ def add_cors(resp):
 
 def now_str():
     return datetime.now().strftime("%H:%M:%S")
+
+
+def emit_soroush_event(notice_text=""):
+    global event_seq
+    event_seq += 1
+    if notice_text:
+        state["event_notice"] = notice_text
+    return event_seq
 
 
 def norm_acc_key(val):
@@ -498,6 +508,7 @@ def mark_account_kicked(acc_key, reason="اکانت از سشن خارج شد.")
         state["kicked_out"] = True
         state["healer_status"] = "خارج شده از اکانت"
         state["auth_msg"] = f"خروج از اکانت تشخیص داده شد: {reason}"
+    emit_soroush_event("وضعیت اکانت تغییر کرد")
 
 
 def is_acc_ready(acc_key):
@@ -574,6 +585,7 @@ async def refresh_groups(acc_key="", force_alive=True):
         if items:
             groups_by_acc[target_key] = items
             save_groups_cache()
+            emit_soroush_event(f"لیست چت‌ها ({len(items)}) دریافت شد")
     except Exception as e:
         if is_kicked_error(e):
             mark_account_kicked(target_key, str(e)[:80])
@@ -617,6 +629,7 @@ async def connect_single_account(acc_obj, force_new=False):
             state["soroush_connected"] = bool(sess)
             state["healer_status"] = "متصل به سروش" if sess else "در انتظار ورود"
         if sess:
+            emit_soroush_event(f"سروش به پنل متصل شد ({acc_obj.get('name') or acc_key})")
             asyncio.create_task(refresh_groups(acc_key, force_alive=False))
         return True
     except Exception as e:
@@ -626,9 +639,14 @@ async def connect_single_account(acc_obj, force_new=False):
 
 
 async def ensure_accounts_connected():
+    connected_any = False
     for a in list(accounts):
         if a.get("session") and not a.get("kicked") and not is_acc_ready(a["key"]):
-            await connect_single_account(a)
+            ok = await connect_single_account(a)
+            if ok:
+                connected_any = True
+    if connected_any:
+        emit_soroush_event("اتصال سروش برقرار شد و اطلاعات بروز شد")
 
 
 async def check_acc_alive(acc_key):
@@ -769,6 +787,7 @@ async def do_verify_code(code):
         state["soroush_connected"] = True
         state["healer_status"] = "متصل به سروش"
         state["auth_msg"] = f"اکانت {name} متصل شد."
+        emit_soroush_event(f"اکانت {name} به سروش وصل شد")
         try:
             await refresh_groups(acc_key, force_alive=False)
         except Exception:
@@ -1247,7 +1266,31 @@ def api_hello():
         schedule_bg(ensure_accounts_connected())
     if cur_key and not groups_by_acc.get(cur_key):
         schedule_bg(refresh_groups(cur_key, force_alive=True))
-    return jsonify({"ok": True, "returning": True, "active_acc_key": cur_key})
+    return jsonify({
+        "ok": True,
+        "returning": True,
+        "active_acc_key": cur_key,
+        "event_seq": event_seq,
+        "event_notice": state["event_notice"],
+    })
+
+
+@app.route("/api/soroush_ping")
+def api_soroush_ping():
+    cur_key = resolve_acc_key(request.args.get("acc_key") or "")
+    if cur_key and not is_acc_ready(cur_key):
+        fut = run_async(ensure_accounts_connected())
+        if fut:
+            try:
+                fut.result(timeout=6)
+            except Exception:
+                pass
+    return jsonify({
+        "ok": True,
+        "soroush_connected": is_acc_ready(cur_key) if cur_key else False,
+        "event_seq": event_seq,
+        "event_notice": state["event_notice"] or "سروش وصل است",
+    })
 
 
 @app.route("/api/send_phone")
@@ -1259,7 +1302,7 @@ def api_send_phone():
             fut.result(timeout=15)
         except Exception:
             pass
-    return jsonify({"ok": True, "auth_msg": state["auth_msg"], "active_acc_key": active_acc_key})
+    return jsonify({"ok": True, "auth_msg": state["auth_msg"], "active_acc_key": active_acc_key, "event_seq": event_seq})
 
 
 @app.route("/api/verify_code")
@@ -1271,7 +1314,13 @@ def api_verify_code():
             fut.result(timeout=15)
         except Exception:
             pass
-    return jsonify({"ok": True, "auth_msg": state["auth_msg"], "active_acc_key": active_acc_key})
+    return jsonify({
+        "ok": True,
+        "auth_msg": state["auth_msg"],
+        "active_acc_key": active_acc_key,
+        "event_seq": event_seq,
+        "event_notice": state["event_notice"],
+    })
 
 
 @app.route("/api/switch_account")
@@ -1285,6 +1334,7 @@ def api_switch_account():
             state["kicked_out"] = bool(a.get("kicked"))
             state["soroush_connected"] = is_acc_ready(key)
             state["auth_msg"] = f"اکانت فعال: {a.get('name') or a.get('phone')}"
+            emit_soroush_event(f"اکانت فعال تغییر کرد به {a.get('name') or a.get('phone')}")
             save_sessions()
             if not groups_by_acc.get(key):
                 fut = run_async(refresh_groups(key))
@@ -1293,7 +1343,12 @@ def api_switch_account():
                         fut.result(timeout=5)
                     except Exception:
                         pass
-            return jsonify({"ok": True, "active_acc_key": active_acc_key, "groups": groups_by_acc.get(key, [])})
+            return jsonify({
+                "ok": True,
+                "active_acc_key": active_acc_key,
+                "groups": groups_by_acc.get(key, []),
+                "event_seq": event_seq,
+            })
     return jsonify({"ok": False, "msg": "اکانت پیدا نشد."})
 
 
@@ -1318,7 +1373,8 @@ def api_del_account():
     state["soroush_connected"] = is_acc_ready(active_acc_key) if active_acc_key else False
     state["kicked_out"] = False
     state["healer_status"] = "حذف‌شده"
-    return jsonify({"ok": True, "active_acc_key": active_acc_key})
+    emit_soroush_event("لیست اکانت‌ها بروز شد")
+    return jsonify({"ok": True, "active_acc_key": active_acc_key, "event_seq": event_seq})
 
 
 @app.route("/api/groups")
@@ -1414,6 +1470,7 @@ def api_add_enemy():
     }
     enemy_rules.append(er)
     save_enemies()
+    emit_soroush_event(f"دشمن «{user_name}» فعال شد")
     return jsonify({"ok": True, "msg": f"دشمن «{user_name}» ({len(reply_texts)} متن) برای اکانت {get_acc_label(acc_key)} ثبت شد."})
 
 
@@ -1432,6 +1489,7 @@ def api_enemy_ctrl():
                 enemy_rules.remove(er)
             break
     save_enemies()
+    emit_soroush_event("وضعیت لیست دشمن‌ها بروز شد")
     return jsonify({"ok": True})
 
 
@@ -1502,6 +1560,7 @@ def api_add_job():
     }
     jobs.append(job)
     save_jobs()
+    emit_soroush_event(f"تسک #{job['id']} شروع شد")
     return jsonify({"ok": True, "msg": f"تسک {mode} #{job['id']} روی اکانت {acc_label} شروع شد."})
 
 
@@ -1525,6 +1584,7 @@ def api_job_ctrl():
                 jobs.remove(j)
             break
     save_jobs()
+    emit_soroush_event("لیست تسک‌ها بروز شد")
     return jsonify({"ok": True})
 
 
@@ -1571,6 +1631,8 @@ def api_state():
         "soroush_connected": cur_ready,
         "kicked_out": cur_kicked,
         "auth_msg": state["auth_msg"],
+        "event_seq": event_seq,
+        "event_notice": state["event_notice"],
         "active_acc_key": cur_key,
         "accounts": acc_list_out,
         "groups": cur_groups,
