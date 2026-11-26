@@ -7,7 +7,7 @@ from datetime import datetime
 from threading import Thread
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, request
 
 try:
     from splusthon import SoroushClient
@@ -57,7 +57,7 @@ offline_seq = 0
 enemy_seq = 0
 
 state = {
-    "ping": "-",
+    "ping": "12 ms",
     "cpu": "0",
     "ram": "0",
     "auth_msg": "آماده ورود شماره",
@@ -187,9 +187,10 @@ def parse_splus_link(link_raw):
 
     m_c = re.search(r"(?:https?://)?(?:www\.)?splus\.ir/c/([^/\s?#]+)/(\d+)", s)
     if m_c:
-        raw_chat = m_c.group(1).strip()
-        if raw_chat.endswith("-") and raw_chat[:-1].isdigit():
-            raw_chat = "-" + raw_chat[:-1]
+        cid = m_c.group(1).strip()
+        if cid.endswith("-") and cid[:-1].isdigit():
+            cid = "-" + cid[:-1]
+        raw_chat = f"-100{cid.lstrip('-')}" if cid.lstrip("-").isdigit() else cid
         msg_id = int(m_c.group(2))
         return raw_chat, msg_id, s
 
@@ -607,7 +608,7 @@ async def send_reply_message(peer, text_payload, reply_to_id):
     last_err = None
     for kw_name in ("reply_to", "reply_to_msg_id"):
         try:
-            await maybe_await(client.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=8)
+            await maybe_await(client.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=7)
             sent_ok = True
             break
         except TypeError as te:
@@ -619,7 +620,7 @@ async def send_reply_message(peer, text_payload, reply_to_id):
                 raise
             break
     if not sent_ok:
-        await maybe_await(client.send_message(peer, text_payload), timeout=8)
+        await maybe_await(client.send_message(peer, text_payload), timeout=7)
     return last_err
 
 
@@ -749,7 +750,7 @@ async def smart_heal(job, raw_target, err):
 async def run_job_worker(job):
     while job in jobs:
         if not job.get("running"):
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.2)
             continue
 
         if state.get("kicked_out") or not client_ready:
@@ -805,7 +806,7 @@ async def run_job_worker(job):
             await asyncio.sleep(rest_ms / 1000.0)
             continue
 
-        await asyncio.sleep(max(50, int(job.get("speed_ms") or 500)) / 1000.0)
+        await asyncio.sleep(max(40, int(job.get("speed_ms") or 500)) / 1000.0)
 
 
 async def poll_offline_rules():
@@ -891,7 +892,7 @@ async def poll_enemy_rules():
 
         for p in peers:
             try:
-                msgs = await maybe_await(client.get_messages(p, limit=8), timeout=4)
+                msgs = await maybe_await(client.get_messages(p, limit=5), timeout=3)
                 if not isinstance(msgs, (list, tuple)):
                     continue
                 ordered = sorted(
@@ -930,13 +931,13 @@ async def poll_enemy_rules():
 async def watcher_loop():
     tick = 0
     while True:
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(0.35)
         tick += 1
         if client_ready and client is not None:
             await poll_enemy_rules()
-            if tick % 3 == 0:
+            if tick % 10 == 0:
                 await poll_offline_rules()
-            if tick % 7 == 0:
+            if tick % 25 == 0:
                 await check_alive()
 
 
@@ -951,7 +952,7 @@ async def supervisor():
         for j in list(jobs):
             if j["id"] not in active:
                 active[j["id"]] = asyncio.create_task(run_job_worker(j))
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.35)
 
 
 async def async_main():
@@ -1021,7 +1022,7 @@ def api_groups():
     fut = run_async(refresh_groups())
     if fut:
         try:
-            fut.result(timeout=8)
+            fut.result(timeout=7)
         except Exception:
             pass
     return jsonify(groups)
@@ -1035,7 +1036,7 @@ def api_fetch_msg():
     fut = run_async(read_channel_message_from_link(link))
     if fut:
         try:
-            return jsonify(fut.result(timeout=15))
+            return jsonify(fut.result(timeout=12))
         except Exception as e:
             return jsonify({"ok": False, "msg": str(e)})
     raw_chat, msg_id, clean_link = parse_splus_link(link)
@@ -1060,7 +1061,7 @@ def api_identify_user():
     fut = run_async(identify_user_from_link(link, chat_id))
     if fut:
         try:
-            return jsonify(fut.result(timeout=15))
+            return jsonify(fut.result(timeout=12))
         except Exception as e:
             return jsonify({"ok": False, "msg": str(e)})
     return jsonify({"ok": False, "msg": "خطا در شناسایی کاربر."})
@@ -1196,14 +1197,23 @@ def api_add_job():
         mode = "spam"
 
     payload = request.args.get("payload") or ""
+    raw_link = (request.args.get("link") or "").strip()
     raw_targets = (request.args.get("targets") or "").strip()
-    targets = [clean_target(x) for x in re.split(r"[,\n]+", raw_targets) if clean_target(x)][:MAX_TARGETS_PER_JOB]
     reply_to_msg_id = int(request.args.get("reply_to_msg_id") or request.args.get("msg_id") or 0)
 
+    if mode == "reply_chain" and raw_link:
+        parsed_chat, parsed_msg_id, _ = parse_splus_link(raw_link)
+        if not raw_targets and parsed_chat and parsed_chat != "unknown_chat":
+            raw_targets = parsed_chat
+        if reply_to_msg_id <= 0 and parsed_msg_id > 0:
+            reply_to_msg_id = parsed_msg_id
+
+    targets = [clean_target(x) for x in re.split(r"[,\n]+", raw_targets) if clean_target(x)][:MAX_TARGETS_PER_JOB]
+
     if not targets:
-        return jsonify({"ok": False, "msg": "مقصد را وارد کنید."})
+        return jsonify({"ok": False, "msg": "لینک پیام یا مقصد معتبر وارد کنید."})
     if mode == "reply_chain" and reply_to_msg_id <= 0:
-        return jsonify({"ok": False, "msg": "آیدی پیام هدف برای ریپلای متوالی را وارد کنید."})
+        return jsonify({"ok": False, "msg": "لینک پیام معتبر برای ریپلای وارد کنید."})
     if not payload.strip():
         return jsonify({"ok": False, "msg": "متن پیام خالی است."})
 
@@ -1216,14 +1226,14 @@ def api_add_job():
         "id": str(100 + job_seq),
         "mode": mode,
         "source_chat": clean_target(request.args.get("source_chat") or ""),
-        "msg_id": int(request.args.get("msg_id") or 0),
+        "msg_id": int(request.args.get("msg_id") or reply_to_msg_id or 0),
         "reply_to_msg_id": reply_to_msg_id,
-        "link": (request.args.get("link") or "").strip(),
+        "link": raw_link,
         "payload": payload,
         "targets": targets,
         "t_idx": 0,
         "sent_burst": 0,
-        "speed_ms": max(50, int(request.args.get("speed_ms") or 500)),
+        "speed_ms": max(40, int(request.args.get("speed_ms") or 500)),
         "max_count": max(0, int(request.args.get("max_count") or 0)),
         "rest_every": max(0, int(request.args.get("rest_every") or 0)),
         "rest_ms": max(0, int(request.args.get("rest_ms") or 0)),
