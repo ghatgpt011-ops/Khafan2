@@ -7,9 +7,14 @@ from datetime import datetime
 from threading import Thread
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request
-from splusthon import SoroushClient
-from splusthon.sessions import StringSession
+from flask import Flask, jsonify, render_template_string, request
+
+try:
+    from splusthon import SoroushClient
+    from splusthon.sessions import StringSession
+except Exception:
+    SoroushClient = None
+    StringSession = None
 
 try:
     import psutil
@@ -45,14 +50,14 @@ app = Flask(__name__)
 accounts = []
 groups = []
 jobs = []
-offline_trackers = []
+offline_rules = []
 enemy_rules = []
 job_seq = 0
-tracker_seq = 0
+offline_seq = 0
 enemy_seq = 0
 
 state = {
-    "ping": "-",
+    "ping": "12 ms",
     "cpu": "0",
     "ram": "0",
     "auth_msg": "آماده ورود شماره",
@@ -256,7 +261,11 @@ def get_msg_id_val(obj):
 def get_sender_info(msg_obj):
     if msg_obj is None:
         return "", ""
-    sender = getattr(msg_obj, "sender", None) or getattr(msg_obj, "from_user", None) or getattr(msg_obj, "user", None)
+    sender = (
+        getattr(msg_obj, "sender", None)
+        or getattr(msg_obj, "from_user", None)
+        or getattr(msg_obj, "user", None)
+    )
     uid = ""
     uname = ""
     for attr in ("sender_id", "from_id", "user_id"):
@@ -307,6 +316,9 @@ def mark_kicked_out(reason="اکانت از سشن خارج شد."):
     for er in enemy_rules:
         if er.get("running"):
             er["running"] = False
+    for ofr in offline_rules:
+        if ofr.get("running"):
+            ofr["running"] = False
     if changed:
         save_jobs()
 
@@ -318,6 +330,8 @@ def run_async(coro):
 
 async def try_reconnect_session():
     global client, client_ready
+    if not SoroushClient or not StringSession:
+        return False
     sess = load_session()
     if not sess:
         return False
@@ -377,6 +391,9 @@ async def do_send_code(phone):
     state["phone"] = phone
     state["kicked_out"] = False
     state["auth_msg"] = "در حال ارسال کد..."
+    if not SoroushClient or not StringSession:
+        state["auth_msg"] = "کتابخانه splusthon روی سرور نصب نیست."
+        return
     try:
         if client is not None and hasattr(client, "disconnect"):
             try:
@@ -563,14 +580,15 @@ async def read_channel_message_from_link(link_raw):
     }
 
 
-async def identify_enemy_from_link(link_raw):
+async def identify_user_from_link(link_raw, forced_chat=""):
     raw_chat, msg_id, clean_link = parse_splus_link(link_raw)
-    msg_obj, resolved_chat_id, channel_name = await fetch_single_message(raw_chat, msg_id)
+    chat_to_use = clean_target(forced_chat) or raw_chat
+    msg_obj, resolved_chat_id, channel_name = await fetch_single_message(chat_to_use, msg_id)
     user_id, user_name = get_sender_info(msg_obj)
     if not user_id and not user_name:
         return {
             "ok": False,
-            "msg": f"کاربر پیام #{msg_id} در چت {resolved_chat_id} شناسایی نشد (مطمئن شو اکانت در این چت دسترسی دارد).",
+            "msg": f"کاربر پیام #{msg_id} در چت {resolved_chat_id} شناسایی نشد (مطمئن شو اکانت در چت دسترسی دارد).",
         }
     return {
         "ok": True,
@@ -790,33 +808,78 @@ async def run_job_worker(job):
         await asyncio.sleep(max(50, int(job.get("speed_ms") or 500)) / 1000.0)
 
 
-async def poll_offline_trackers():
+async def poll_offline_rules():
     if not client_ready or client is None or not hasattr(client, "get_messages"):
         return
-    for tr in list(offline_trackers):
-        if not tr.get("running"):
+    now_ts = time.time()
+    for rule in list(offline_rules):
+        if not rule.get("running"):
             continue
-        target_user = str(tr.get("user") or "").strip().lstrip("@").lower()
-        chat_raw = tr.get("chat_id") or ""
-        peers = peer_candidates(chat_raw) if chat_raw else [d["id"] for d in groups[:10]]
+        peers = peer_candidates(rule.get("chat_id"))
+        if not peers:
+            continue
+        users = rule.get("users") or []
+        if not users:
+            continue
+
+        timeout_sec = max(10, float(rule.get("minutes") or 1) * 60.0)
+        reply_text = str(rule.get("reply_text") or "").strip()
+
         for p in peers:
             try:
-                msgs = await maybe_await(client.get_messages(p, limit=5), timeout=5)
+                msgs = await maybe_await(client.get_messages(p, limit=15), timeout=5)
                 if not isinstance(msgs, (list, tuple)):
                     continue
-                for m in msgs:
-                    mid = get_msg_id_val(m)
-                    if not mid or mid == int(tr.get("last_seen_msg_id") or 0):
-                        continue
-                    uid, uname = get_sender_info(m)
-                    hay = f"{uid} {uname}".lower()
-                    if target_user and target_user in hay:
-                        tr["last_seen_msg_id"] = mid
-                        tr["status"] = "فعال / آنلاین (پیام جدید ثبت شد)"
-                        tr["last_seen"] = now_str()
-                        break
-            except Exception:
-                continue
+                for u in users:
+                    uid_key = str(u.get("user_id") or "").strip().lower()
+                    uname_key = str(u.get("user_name") or "").strip().lower()
+                    matched_msg = None
+                    for m in msgs:
+                        uid, uname = get_sender_info(m)
+                        if (uid_key and uid_key == str(uid).lower()) or (
+                            uname_key and uname_key in f"{uid} {uname}".lower()
+                        ):
+                            matched_msg = m
+                            break
+
+                    if matched_msg is not None:
+                        mid = get_msg_id_val(matched_msg)
+                        if mid and mid != int(u.get("last_msg_id") or 0):
+                            u["last_msg_id"] = mid
+                            u["last_msg_ts"] = now_ts
+                            u["replied_for_msg_id"] = 0
+                            u["status"] = f"پیام #{mid} ثبت شد (در حال پایش سکوت)"
+
+                        last_ts = float(u.get("last_msg_ts") or 0)
+                        cur_mid = int(u.get("last_msg_id") or 0)
+                        replied_mid = int(u.get("replied_for_msg_id") or 0)
+                        if last_ts > 0 and cur_mid > 0 and replied_mid != cur_mid and reply_text:
+                            elapsed = now_ts - last_ts
+                            if elapsed >= timeout_sec:
+                                async with op_lock:
+                                    await send_reply_message(p, reply_text, cur_mid)
+                                u["replied_for_msg_id"] = cur_mid
+                                u["replied_count"] = int(u.get("replied_count") or 0) + 1
+                                u["status"] = f"آفلاین شد → ریپلای روی #{cur_mid} ({now_str()})"
+                            else:
+                                rem_sec = int(timeout_sec - elapsed)
+                                u["status"] = f"فعال (مانده تا آفلاین: {rem_sec}s)"
+                    else:
+                        last_ts = float(u.get("last_msg_ts") or 0)
+                        cur_mid = int(u.get("last_msg_id") or 0)
+                        replied_mid = int(u.get("replied_for_msg_id") or 0)
+                        if last_ts > 0 and cur_mid > 0 and replied_mid != cur_mid and reply_text:
+                            elapsed = now_ts - last_ts
+                            if elapsed >= timeout_sec:
+                                async with op_lock:
+                                    await send_reply_message(p, reply_text, cur_mid)
+                                u["replied_for_msg_id"] = cur_mid
+                                u["replied_count"] = int(u.get("replied_count") or 0) + 1
+                                u["status"] = f"آفلاین شد → ریپلای روی #{cur_mid} ({now_str()})"
+            except Exception as e:
+                if is_kicked_error(e):
+                    mark_kicked_out(str(e)[:80])
+                    break
 
 
 async def poll_enemy_rules():
@@ -883,8 +946,8 @@ async def watcher_loop():
         tick += 1
         if client_ready and client is not None:
             await poll_enemy_rules()
-            if tick % 4 == 0:
-                await poll_offline_trackers()
+            if tick % 3 == 0:
+                await poll_offline_rules()
             if tick % 7 == 0:
                 await check_alive()
 
@@ -921,10 +984,14 @@ def start_bot_thread():
             time.sleep(1)
 
 
-@app.route("/")
 @app.route("/health")
 def health():
-    return "OK", 200
+    return jsonify({"ok": True, "status": "OK"})
+
+
+@app.route("/panel")
+def panel_direct():
+    return render_template_string(PANEL_HTML)
 
 
 @app.route("/api/send_phone")
@@ -1000,49 +1067,87 @@ def api_fetch_msg():
     })
 
 
-@app.route("/api/add_offline_tracker")
-def api_add_offline_tracker():
-    global tracker_seq
-    user = (request.args.get("user") or "").strip().lstrip("@")
-    chat_id = clean_target(request.args.get("chat_id") or "")
-    if not user:
-        return jsonify({"ok": False, "msg": "شناسه یا یوزرنیم کاربر را وارد کنید."})
-    tracker_seq += 1
-    tr = {
-        "id": str(tracker_seq),
-        "user": user,
-        "chat_id": chat_id,
-        "status": "در حال پایش آفلاین/آنلاین",
-        "last_seen": now_str(),
-        "last_seen_msg_id": 0,
-        "running": True,
-    }
-    offline_trackers.append(tr)
-    return jsonify({"ok": True, "msg": f"آفلاین‌گیر برای {user} فعال شد."})
-
-
-@app.route("/api/del_offline_tracker")
-def api_del_offline_tracker():
-    tid = (request.args.get("id") or "").strip()
-    for t in list(offline_trackers):
-        if t["id"] == tid:
-            offline_trackers.remove(t)
-            break
-    return jsonify({"ok": True})
-
-
-@app.route("/api/identify_enemy")
-def api_identify_enemy():
+@app.route("/api/identify_user")
+def api_identify_user():
     link = (request.args.get("link") or "").strip()
+    chat_id = (request.args.get("chat_id") or "").strip()
     if not link:
-        return jsonify({"ok": False, "msg": "لینک پیام کاربر را وارد کنید."})
-    fut = run_async(identify_enemy_from_link(link))
+        return jsonify({"ok": False, "msg": "لینک پیام را وارد کنید."})
+    fut = run_async(identify_user_from_link(link, chat_id))
     if fut:
         try:
             return jsonify(fut.result(timeout=15))
         except Exception as e:
             return jsonify({"ok": False, "msg": str(e)})
     return jsonify({"ok": False, "msg": "خطا در شناسایی کاربر."})
+
+
+@app.route("/api/save_offline_rule")
+def api_save_offline_rule():
+    global offline_seq
+    chat_id = clean_target(request.args.get("chat_id") or "")
+    minutes = max(0.1, float(request.args.get("minutes") or 3))
+    reply_text = (request.args.get("reply_text") or "").strip()
+    raw_users = request.args.get("users") or "[]"
+    try:
+        users_in = json.loads(raw_users)
+    except Exception:
+        users_in = []
+
+    if not chat_id:
+        return jsonify({"ok": False, "msg": "ابتدا چت را انتخاب کنید."})
+    if not users_in:
+        return jsonify({"ok": False, "msg": "حداقل یک کاربر را با لینک پیام به لیست اضافه کنید."})
+    if not reply_text:
+        return jsonify({"ok": False, "msg": "متن ریپلای آفلاین را وارد کنید."})
+
+    cleaned_users = []
+    now_ts = time.time()
+    for u in users_in:
+        if not isinstance(u, dict):
+            continue
+        uid = str(u.get("user_id") or "").strip()
+        uname = str(u.get("user_name") or uid).strip()
+        mid = int(u.get("msg_id") or 0)
+        if uid or uname:
+            cleaned_users.append({
+                "user_id": uid or uname,
+                "user_name": uname or uid,
+                "last_msg_id": mid,
+                "last_msg_ts": now_ts if mid > 0 else 0,
+                "replied_for_msg_id": 0,
+                "replied_count": 0,
+                "status": f"در انتظار سکوت {minutes} دقیقه‌ای",
+            })
+
+    if not cleaned_users:
+        return jsonify({"ok": False, "msg": "کاربر معتبری در لیست نیست."})
+
+    offline_seq += 1
+    rule = {
+        "id": str(offline_seq),
+        "chat_id": chat_id,
+        "minutes": minutes,
+        "reply_text": reply_text,
+        "users": cleaned_users,
+        "running": True,
+    }
+    offline_rules.append(rule)
+    return jsonify({"ok": True, "msg": f"قانون آفلاینی بگیر برای {len(cleaned_users)} کاربر در چت {chat_id} فعال شد."})
+
+
+@app.route("/api/offline_ctrl")
+def api_offline_ctrl():
+    oid = (request.args.get("id") or "").strip()
+    act = (request.args.get("act") or "").strip()
+    for r in list(offline_rules):
+        if r["id"] == oid:
+            if act == "toggle":
+                r["running"] = not r.get("running", False)
+            elif act == "delete":
+                offline_rules.remove(r)
+            break
+    return jsonify({"ok": True})
 
 
 @app.route("/api/add_enemy")
@@ -1174,26 +1279,686 @@ def api_job_ctrl():
 
 @app.route("/api/state")
 def api_state():
-    if psutil:
-        try:
+    try:
+        if psutil:
             state["cpu"] = str(int(psutil.cpu_percent(interval=None)))
             state["ram"] = str(int(psutil.virtual_memory().percent))
-        except Exception:
-            pass
+    except Exception:
+        pass
     return jsonify({
-        "ping": state["ping"],
-        "cpu": state["cpu"],
-        "ram": state["ram"],
-        "healer_status": state["healer_status"],
-        "soroush_connected": state["soroush_connected"],
-        "kicked_out": state["kicked_out"],
-        "auth_msg": state["auth_msg"],
-        "accounts": accounts,
-        "groups": groups,
-        "jobs": jobs,
-        "offline_trackers": offline_trackers,
-        "enemy_rules": enemy_rules,
+        "ok": True,
+        "ping": state.get("ping", "12 ms"),
+        "cpu": state.get("cpu", "0"),
+        "ram": state.get("ram", "0"),
+        "healer_status": state.get("healer_status", "آماده"),
+        "soroush_connected": bool(state.get("soroush_connected", False)),
+        "kicked_out": bool(state.get("kicked_out", False)),
+        "auth_msg": state.get("auth_msg", "آماده ورود شماره"),
+        "accounts": list(accounts),
+        "groups": list(groups),
+        "jobs": list(jobs),
+        "offline_rules": list(offline_rules),
+        "enemy_rules": list(enemy_rules),
     })
+
+
+PANEL_HTML = """<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FONEX PANEL</title>
+<style>
+  *{box-sizing:border-box;font-family:Tahoma,sans-serif}
+  body{margin:0;padding:10px;color:#f8fafc;background:#070a14}
+  .top{display:flex;justify-content:space-between;align-items:center;background:#101628;border:1px solid #273556;border-radius:12px;padding:10px 12px;margin-bottom:10px}
+  .brand{font-weight:bold;font-size:17px;color:#c084fc}
+  .sys{font-size:11px;color:#94a3b8;margin-top:2px}
+  .btn{border:0;border-radius:8px;padding:8px 11px;color:#fff;font-weight:bold;cursor:pointer;font-size:12px}
+  .bp{background:#7c3aed} .bc{background:#2563eb} .bg{background:#10b981}
+  .bw{background:#f59e0b;color:#090d16} .br{background:#ef4444} .bd{background:#1e293b;border:1px solid #334155}
+  .tabs{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-bottom:10px}
+  .tab{background:#101628;border:1px solid #273556;color:#cbd5e1;border-radius:9px;padding:9px 4px;font-size:11px;font-weight:bold;cursor:pointer;text-align:center}
+  .tab.active{background:#7c3aed;border-color:#a855f7;color:#fff}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px}
+  .st{background:#101628;border:1px solid #273556;border-radius:10px;padding:8px;text-align:center}
+  .st b{display:block;font-size:15px;color:#e9d5ff}.st span{font-size:11px;color:#94a3b8}
+  .box{background:#101628;border:1px solid #273556;border-radius:12px;padding:12px;margin-bottom:10px}
+  h3{margin:0 0 8px;font-size:14px;color:#f1f5f9;border-bottom:1px solid #273556;padding-bottom:6px}
+  label{display:block;font-size:11px;color:#cbd5e1;margin:8px 0 3px}
+  input,textarea{width:100%;padding:8px 10px;border-radius:8px;border:1px solid #273556;background:#090e1c;color:#fff;font-size:12px}
+  textarea{min-height:60px;resize:vertical}
+  .row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px}
+  .g2{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .preview{background:#090e1c;border:1px solid #334155;border-radius:9px;padding:8px;margin-top:8px;font-size:11px}
+  .preview.ok{border-color:#10b981;background:#071b16}
+  .item{background:#16203a;border:1px solid #273556;border-radius:9px;padding:8px;margin-top:6px;font-size:11px;line-height:1.6}
+  .chip{background:#16203a;border:1px solid #273556;border-radius:8px;padding:7px 9px;font-size:11px;display:flex;justify-content:space-between;align-items:center;margin-top:5px}
+  .tag{display:inline-flex;align-items:center;gap:5px;background:#2e1065;border:1px solid #7c3aed;color:#fae8ff;padding:3px 8px;border-radius:7px;margin:2px;font-size:11px}
+  .log{background:#050811;border:1px solid #1e293b;border-radius:6px;padding:6px;margin-top:6px;font-size:11px;color:#67e8f9;max-height:75px;overflow-y:auto;direction:ltr;text-align:left;white-space:pre-line}
+  .msg{font-size:11px;color:#cbd5e1;margin-top:6px;word-break:break-word}
+  .warn{color:#fca5a5;font-weight:bold}
+</style>
+</head>
+<body>
+
+<div class="top">
+  <div>
+    <div class="brand">FONEX PANEL</div>
+    <div class="sys" id="sysInfo">سرور وصل | پینگ: 12 ms | CPU: 0% | RAM: 0%</div>
+  </div>
+  <button class="btn br" onclick="logoutApp()">خروج</button>
+</div>
+
+<div class="tabs">
+  <button class="tab active" id="tab-forward" onclick="switchTab('forward')">فوروارد</button>
+  <button class="tab" id="tab-reply" onclick="switchTab('reply')">ریپلای</button>
+  <button class="tab" id="tab-enemy" onclick="switchTab('enemy')">دشمن</button>
+  <button class="tab" id="tab-spam" onclick="switchTab('spam')">اسپم</button>
+  <button class="tab" id="tab-offline" onclick="switchTab('offline')">آفلاینی بگیر</button>
+</div>
+
+<div class="stats">
+  <div class="st"><b id="sAcc">0</b><span>اکانت</span></div>
+  <div class="st"><b id="sGrp">0</b><span>گروه</span></div>
+  <div class="st"><b id="sRun3" dir="ltr">0 / 3</b><span>فعال (حداکثر ۳)</span></div>
+  <div class="st"><b id="sOk">0</b><span>موفق</span></div>
+  <div class="st"><b id="sRun">0</b><span>در حال اجرا</span></div>
+  <div class="st"><b id="sFail">0</b><span>ناموفق</span></div>
+</div>
+
+<div class="box">
+  <h3>+ اکانت و حساب‌های متصل</h3>
+  <div class="row">
+    <input id="phone" type="text" placeholder="+98912..." dir="ltr" style="flex:1">
+    <button class="btn bp" onclick="sendPhone()">ارسال کد</button>
+  </div>
+  <div id="codeBox" style="display:none;margin-top:6px;">
+    <div class="row">
+      <input id="code" type="text" placeholder="کد ورود" dir="ltr" style="flex:1">
+      <button class="btn bg" onclick="verifyCode()">تأیید کد</button>
+    </div>
+  </div>
+  <div class="msg" id="authMsg">آماده اتصال اکانت</div>
+  <div id="accList"></div>
+</div>
+
+<!-- تب ۱: فوروارد -->
+<div class="box sec-panel" id="sec-forward">
+  <h3>فوروارد پیام از لینک کانال</h3>
+  <label>لینک پیام سروش (مثلاً https://splus.ir/c/25810580/8):</label>
+  <div class="row">
+    <input id="fwdLink" type="text" placeholder="https://splus.ir/c/25810580/8" dir="ltr" style="flex:1">
+    <button class="btn bp" onclick="fetchFwdMsg()">بیار پیام</button>
+  </div>
+
+  <div id="fwdBox" class="preview" style="display:none;">
+    <div id="fwdMeta"></div>
+    <label>متن پیام خوانده‌شده (قابل بررسی/تأیید):</label>
+    <textarea id="fwdText"></textarea>
+    <div class="row">
+      <button id="fwdConfirmBtn" class="btn bg" onclick="confirmFwdMsg()">تأیید پیام</button>
+    </div>
+  </div>
+  <div class="msg" id="fwdPicked">وضعیت پیام: هنوز تأیید نشده است.</div>
+
+  <label>مقصدهای فوروارد (حداکثر ۳ مقصد):</label>
+  <div class="row">
+    <button class="btn bc" onclick="fetchGroups(true, 'fwd')">دریافت لیست چت‌ها</button>
+    <button class="btn bd" onclick="toggleList('fwd')">نمایش/بستن لیست</button>
+  </div>
+  <div id="fwdDstBox" style="display:none;margin-top:6px;">
+    <input id="fwdDstSearch" type="text" placeholder="جستجوی مقصد..." oninput="renderGroupList('fwd')">
+    <div id="fwdDstList"></div>
+  </div>
+  <input id="fwdTargets" type="text" placeholder="-10012345, @target" oninput="renderTags('fwd')" style="margin-top:6px">
+  <div id="fwdTags"></div>
+
+  <div class="g2">
+    <div><label>سرعت فوروارد (ms):</label><input id="fwdSpeed" type="number" value="800" min="50"></div>
+    <div><label>تعداد ارسال (0 = نامحدود):</label><input id="fwdCount" type="number" value="0" min="0"></div>
+  </div>
+  <button class="btn bg" style="width:100%;margin-top:10px" onclick="startForwardJob()">استارت فوروارد</button>
+  <div class="msg" id="fwdMsg"></div>
+</div>
+
+<!-- تب ۲: ریپلای -->
+<div class="box sec-panel" id="sec-reply" style="display:none;">
+  <h3>ریپلای متوالی روی یک پیام مشخص</h3>
+  <div class="g2">
+    <div><label>چت مقصد / گروه:</label><input id="repChat" type="text" placeholder="-10012345" dir="ltr"></div>
+    <div><label>شماره پیام هدف (Message ID):</label><input id="repMsgId" type="number" placeholder="8" dir="ltr"></div>
+  </div>
+  <label>متن ریپلای:</label>
+  <textarea id="repText" placeholder="متنی که روی همین پیام پشت سر هم ریپلای شود..."></textarea>
+  <div class="g2">
+    <div><label>سرعت ریپلای (ms):</label><input id="repSpeed" type="number" value="700" min="50"></div>
+    <div><label>تعداد ریپلای (0 = نامحدود):</label><input id="repCount" type="number" value="5" min="0"></div>
+  </div>
+  <button class="btn bg" style="width:100%;margin-top:10px" onclick="startReplyChain()">استارت ریپلای متوالی</button>
+  <div class="msg" id="repMsg"></div>
+</div>
+
+<!-- تب ۳: دشمن -->
+<div class="box sec-panel" id="sec-enemy" style="display:none;">
+  <h3>دشمن (تشخیص کاربر از لینک پیام در همان چت + ریپلای آنی)</h3>
+  <label>لینک پیام شخص در چت:</label>
+  <div class="row">
+    <input id="enemyLink" type="text" placeholder="https://splus.ir/c/25810580/8" dir="ltr" style="flex:1">
+    <button class="btn bp" onclick="identifyEnemy()">شناسایی کاربر در چت</button>
+  </div>
+  <div class="msg" id="enemyFoundInfo">هنوز کاربری از لینک شناسایی نشده است.</div>
+
+  <label>متن ریپلای دشمن:</label>
+  <textarea id="enemyReplyText" placeholder="متنی که هر بار از این کاربر پیام آمد، همون لحظه رو پیامش ریپلای شود..."></textarea>
+
+  <label>تعداد ریپلای (0 = نامحدود):</label>
+  <input id="enemyCount" type="number" value="0" min="0">
+
+  <button class="btn bg" style="width:100%;margin-top:10px" onclick="startEnemyRule()">فعال‌سازی دشمن</button>
+  <div class="msg" id="enemyMsg"></div>
+  <div id="enemyList"></div>
+</div>
+
+<!-- تب ۴: اسپم -->
+<div class="box sec-panel" id="sec-spam" style="display:none;">
+  <h3>اسپم (حداکثر ۳ مقصد)</h3>
+  <label>متن اسپم:</label>
+  <textarea id="spamText" placeholder="متن اسپم را بنویسید..."></textarea>
+
+  <label>مقصدهای اسپم (حداکثر ۳ مقصد):</label>
+  <div class="row">
+    <button class="btn bc" onclick="fetchGroups(true, 'spam')">دریافت لیست چت‌ها</button>
+    <button class="btn bd" onclick="toggleList('spam')">نمایش/بستن لیست</button>
+  </div>
+  <div id="spamDstBox" style="display:none;margin-top:6px;">
+    <input id="spamDstSearch" type="text" placeholder="جستجوی مقصد..." oninput="renderGroupList('spam')">
+    <div id="spamDstList"></div>
+  </div>
+  <input id="spamTargets" type="text" placeholder="-10012345, @group" oninput="renderTags('spam')" style="margin-top:6px">
+  <div id="spamTags"></div>
+
+  <div class="g2">
+    <div><label>سرعت اسپم (ms):</label><input id="spamSpeed" type="number" value="500" min="50"></div>
+    <div><label>تعداد اسپم (0 = نامحدود):</label><input id="spamCount" type="number" value="0" min="0"></div>
+  </div>
+  <div class="g2">
+    <div><label>استراحت هر (تا) پیام:</label><input id="spamRestEvery" type="number" value="0" min="0"></div>
+    <div><label>مدت استراحت (ms):</label><input id="spamRestMs" type="number" value="2000" min="0"></div>
+  </div>
+  <button class="btn bg" style="width:100%;margin-top:10px" onclick="startSpamJob()">استارت اسپم</button>
+  <div class="msg" id="spamMsg"></div>
+</div>
+
+<!-- تب ۵: آفلاینی بگیر -->
+<div class="box sec-panel" id="sec-offline" style="display:none;">
+  <h3>آفلاینی بگیر (تشخیص کاربر از لینک پیام در چت + ریپلای پس از سکوت)</h3>
+
+  <label>چت مورد نظر:</label>
+  <div class="row">
+    <button class="btn bc" onclick="fetchGroups(true, 'offline')">دریافت لیست چت‌ها</button>
+    <button class="btn bd" onclick="toggleList('offline')">نمایش/بستن لیست</button>
+  </div>
+  <div id="offlineDstBox" style="display:none;margin-top:6px;">
+    <input id="offlineDstSearch" type="text" placeholder="جستجوی چت..." oninput="renderGroupList('offline')">
+    <div id="offlineDstList"></div>
+  </div>
+  <input id="offChatId" type="text" placeholder="شناسه چت (مثلاً -10012345)" dir="ltr" style="margin-top:6px">
+
+  <label>لینک پیام کاربر در همین چت (فقط کاربر را می‌گیرد، کاری به متن پیام ندارد):</label>
+  <div class="row">
+    <input id="offUserLink" type="text" placeholder="https://splus.ir/c/25810580/8" dir="ltr" style="flex:1">
+    <button class="btn bp" onclick="addOfflineUserFromLink()">افزودن کاربر به لیست</button>
+  </div>
+  <div class="msg" id="offUserStatus">هنوز کاربری به لیست آفلاینی بگیر اضافه نشده است.</div>
+  <div id="offUsersList"></div>
+
+  <div class="g2">
+    <div><label>مدت سکوت تا آفلاین شدن (دقیقه):</label><input id="offMinutes" type="number" value="3" min="0.1" step="0.5"></div>
+    <div><label>متن ریپلای روی آخرین پیام کاربر:</label><input id="offReplyText" type="text" placeholder="متن ریپلای پس از آفلاین شدن..."></div>
+  </div>
+
+  <button class="btn bg" style="width:100%;margin-top:10px" onclick="saveOfflineRule()">فعال‌سازی آفلاینی بگیر</button>
+  <div class="msg" id="offMsg"></div>
+  <div id="offRulesList"></div>
+</div>
+
+<div class="box">
+  <h3>تسک‌های فعال و لاگ (حداکثر ۳ هم‌زمان)</h3>
+  <div id="taskList"><div class="msg">تسکی ثبت نشده است.</div></div>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const baseUrl = (params.get('server') || window.location.origin || '').replace(/\/+$/, '');
+let chats = [], tasks = [], accounts = [], offlineRules = [], enemies = [];
+let activePickerMode = 'forward';
+let fwdDraft = null, fwdConfirmed = null;
+let identifiedEnemy = null;
+let offlineSelectedUsers = [];
+
+function switchTab(tabName){
+  const panels = document.querySelectorAll('.sec-panel');
+  panels.forEach(p => p.style.display = 'none');
+  const target = document.getElementById('sec-' + tabName);
+  if(target) target.style.display = 'block';
+
+  const tabs = document.querySelectorAll('.tab');
+  tabs.forEach(t => t.classList.remove('active'));
+  const activeTab = document.getElementById('tab-' + tabName);
+  if(activeTab) activeTab.classList.add('active');
+}
+
+function cleanPeerInput(v){
+  let s = String(v || '').trim().replace(/[\u200f\u200e]/g, '');
+  if(s.endsWith('-') && /^\d+$/.test(s.slice(0, -1))) s = '-' + s.slice(0, -1);
+  return s;
+}
+
+function getTargetsArray(prefix){
+  const id = prefix === 'fwd' ? 'fwdTargets' : 'spamTargets';
+  return (document.getElementById(id).value || '')
+    .split(',')
+    .map(cleanPeerInput)
+    .filter(Boolean);
+}
+
+function toggleList(prefix){
+  activePickerMode = prefix;
+  const mapBox = { fwd: 'fwdDstBox', spam: 'spamDstBox', offline: 'offlineDstBox' };
+  const box = document.getElementById(mapBox[prefix]);
+  if(!box) return;
+  box.style.display = (box.style.display === 'none') ? 'block' : 'none';
+  renderGroupList(prefix);
+}
+
+function renderGroupList(prefix){
+  const mapSearch = { fwd: 'fwdDstSearch', spam: 'spamDstSearch', offline: 'offlineDstSearch' };
+  const mapList = { fwd: 'fwdDstList', spam: 'spamDstList', offline: 'offlineDstList' };
+  const q = ((document.getElementById(mapSearch[prefix]) || {}).value || '').toLowerCase();
+  const list = chats.filter(c => String(c.name || '').toLowerCase().includes(q) || String(c.id || '').includes(q));
+  document.getElementById(mapList[prefix]).innerHTML = list.length ? list.map(c =>
+    `<div class="chip"><span>${c.name || c.id} <small style="color:#94a3b8">(${c.id})</small></span><button class="btn bg" onclick="onPickGroup('${String(c.id).replace(/'/g, '')}','${prefix}')">+</button></div>`
+  ).join('') : '<div class="msg">چتی یافت نشد.</div>';
+}
+
+function onPickGroup(id, prefix){
+  const mapBox = { fwd: 'fwdDstBox', spam: 'spamDstBox', offline: 'offlineDstBox' };
+  document.getElementById(mapBox[prefix]).style.display = 'none';
+  const cleaned = cleanPeerInput(id);
+  if(prefix === 'offline'){
+    document.getElementById('offChatId').value = cleaned;
+    document.getElementById('offUserStatus').innerText = `چت ${cleaned} انتخاب شد؛ حالا لینک پیام کاربر را بده.`;
+    return;
+  }
+  addTag(cleaned, prefix);
+}
+
+function renderTags(prefix){
+  const arr = getTargetsArray(prefix);
+  const el = document.getElementById(prefix === 'fwd' ? 'fwdTags' : 'spamTags');
+  if(!arr.length){ el.innerHTML = '<div class="msg">مقصدی انتخاب نشده است.</div>'; return; }
+  el.innerHTML = arr.map((t,i) => `<span class="tag">${t} <b style="cursor:pointer" onclick="removeTag(${i},'${prefix}')">×</b></span>`).join('')
+    + (arr.length > 3 ? '<div class="msg warn">حداکثر ۳ مقصد مجاز است.</div>' : '');
+}
+
+function removeTag(i, prefix){
+  const inp = document.getElementById(prefix === 'fwd' ? 'fwdTargets' : 'spamTargets');
+  const arr = getTargetsArray(prefix);
+  arr.splice(i, 1);
+  inp.value = arr.join(', ');
+  renderTags(prefix);
+}
+
+function addTag(val, prefix){
+  const inp = document.getElementById(prefix === 'fwd' ? 'fwdTargets' : 'spamTargets');
+  const msgEl = document.getElementById(prefix === 'fwd' ? 'fwdMsg' : 'spamMsg');
+  const arr = getTargetsArray(prefix);
+  if(!val || arr.includes(val)) return;
+  if(arr.length >= 3){
+    msgEl.innerText = 'حداکثر ۳ مقصد هم‌زمان مجاز است.';
+    return;
+  }
+  arr.push(val);
+  inp.value = arr.join(', ');
+  renderTags(prefix);
+}
+
+async function addOfflineUserFromLink(){
+  const link = document.getElementById('offUserLink').value.trim();
+  const chatId = document.getElementById('offChatId').value.trim();
+  const stEl = document.getElementById('offUserStatus');
+  if(!link){ stEl.innerText = 'لینک پیام کاربر را وارد کن.'; return; }
+  stEl.innerText = 'در حال شناسایی کاربر از لینک...';
+  const d = await api('/api/identify_user', `?link=${encodeURIComponent(link)}&chat_id=${encodeURIComponent(chatId)}`);
+  if(!d || !d.ok){
+    stEl.innerText = (d && d.msg) || 'کاربر شناسایی نشد.';
+    return;
+  }
+  if(!chatId && d.chat_id){
+    document.getElementById('offChatId').value = d.chat_id;
+  }
+  const exists = offlineSelectedUsers.some(x => String(x.user_id) === String(d.user_id));
+  if(!exists){
+    offlineSelectedUsers.push({
+      user_id: d.user_id,
+      user_name: d.user_name,
+      msg_id: d.msg_id || 0
+    });
+  }
+  stEl.innerText = `کاربر «${d.user_name}» به لیست آفلاینی بگیر اضافه شد.`;
+  document.getElementById('offUserLink').value = '';
+  renderOfflineSelectedUsers();
+}
+
+function removeOfflineSelectedUser(idx){
+  offlineSelectedUsers.splice(idx, 1);
+  renderOfflineSelectedUsers();
+}
+
+function renderOfflineSelectedUsers(){
+  const el = document.getElementById('offUsersList');
+  if(!offlineSelectedUsers.length){
+    el.innerHTML = '<div class="msg">کاربری در لیست نیست.</div>';
+    return;
+  }
+  el.innerHTML = offlineSelectedUsers.map((u, idx) =>
+    `<span class="tag">${u.user_name} (${u.user_id}) <b style="cursor:pointer" onclick="removeOfflineSelectedUser(${idx})">×</b></span>`
+  ).join('');
+}
+
+async function saveOfflineRule(){
+  const chatId = cleanPeerInput(document.getElementById('offChatId').value);
+  const minutes = document.getElementById('offMinutes').value || 3;
+  const replyText = document.getElementById('offReplyText').value.trim();
+  const msgEl = document.getElementById('offMsg');
+  const q = `?chat_id=${encodeURIComponent(chatId)}&minutes=${encodeURIComponent(minutes)}&reply_text=${encodeURIComponent(replyText)}&users=${encodeURIComponent(JSON.stringify(offlineSelectedUsers))}`;
+  const d = await api('/api/save_offline_rule', q);
+  msgEl.innerText = (d && d.msg) || 'انجام شد';
+  poll();
+}
+
+async function ctrlOfflineRule(id, act){
+  await api('/api/offline_ctrl', `?id=${encodeURIComponent(id)}&act=${encodeURIComponent(act)}`);
+  poll();
+}
+
+function renderOfflineRules(){
+  const el = document.getElementById('offRulesList');
+  if(!offlineRules.length){
+    el.innerHTML = '<div class="msg">قانون آفلاینی فعالی ثبت نشده است.</div>';
+    return;
+  }
+  el.innerHTML = offlineRules.map(r => {
+    const uHtml = (r.users || []).map(u =>
+      `<div>• <b>${u.user_name}</b> (${u.user_id}) — ${u.status || 'در انتظار'} | ریپلای‌شده: ${u.replied_count || 0}</div>`
+    ).join('');
+    return `<div class="item">
+      <b>چت: ${r.chat_id}</b> | زمان سکوت: <b>${r.minutes} دقیقه</b> | وضعیت: <b>${r.running ? 'فعال' : 'متوقف'}</b><br>
+      متن ریپلای: ${r.reply_text}<br>
+      ${uHtml}
+      <div class="row">
+        <button class="btn bw" onclick="ctrlOfflineRule('${r.id}','toggle')">${r.running ? 'توقف' : 'ادامه'}</button>
+        <button class="btn br" onclick="ctrlOfflineRule('${r.id}','delete')">حذف</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function identifyEnemy(){
+  const link = document.getElementById('enemyLink').value.trim();
+  const infoEl = document.getElementById('enemyFoundInfo');
+  if(!link){ infoEl.innerText = 'لینک پیام را وارد کن.'; return; }
+  identifiedEnemy = null;
+  infoEl.innerText = 'در حال شناسایی کاربر در چت...';
+  const d = await api('/api/identify_user', `?link=${encodeURIComponent(link)}`);
+  if(!d || !d.ok){
+    infoEl.innerText = (d && d.msg) || 'کاربر شناسایی نشد.';
+    return;
+  }
+  identifiedEnemy = d;
+  const chTitle = d.channel_name ? `${d.channel_name} (${d.chat_id})` : d.chat_id;
+  infoEl.innerText = `کاربر شناسایی‌شده در چت ${chTitle}: ${d.user_name} (${d.user_id})`;
+}
+
+async function startEnemyRule(){
+  const msgEl = document.getElementById('enemyMsg');
+  const replyText = document.getElementById('enemyReplyText').value.trim();
+  const count = document.getElementById('enemyCount').value || 0;
+  if(!identifiedEnemy){
+    msgEl.innerText = 'ابتدا لینک پیام را بده و «شناسایی کاربر در چت» را بزن.';
+    return;
+  }
+  if(!replyText){
+    msgEl.innerText = 'متن ریپلای دشمن را وارد کن.';
+    return;
+  }
+  const q = `?chat_id=${encodeURIComponent(identifiedEnemy.chat_id)}&user_id=${encodeURIComponent(identifiedEnemy.user_id)}&user_name=${encodeURIComponent(identifiedEnemy.user_name)}&reply_text=${encodeURIComponent(replyText)}&max_count=${count}`;
+  const d = await api('/api/add_enemy', q);
+  msgEl.innerText = (d && d.msg) || 'انجام شد';
+  poll();
+}
+
+async function ctrlEnemy(id, act){
+  await api('/api/enemy_ctrl', `?id=${encodeURIComponent(id)}&act=${encodeURIComponent(act)}`);
+  poll();
+}
+
+function renderEnemyList(){
+  document.getElementById('enemyList').innerHTML = enemies.length ? enemies.map(e =>
+    `<div class="item">
+      <b>دشمن: ${e.user_name}</b> (${e.user_id}) | چت: ${e.chat_id}<br>
+      وضعیت: <b>${e.status}</b> | ریپلای‌شده: ${e.replied_count || 0}${e.max_count ? ' / ' + e.max_count : ''}<br>
+      متن ریپلای: ${e.reply_text}
+      <div class="row">
+        <button class="btn bw" onclick="ctrlEnemy('${e.id}','toggle')">${e.running ? 'توقف' : 'ادامه'}</button>
+        <button class="btn br" onclick="ctrlEnemy('${e.id}','delete')">حذف</button>
+      </div>
+    </div>`
+  ).join('') : '<div class="msg">دشمنی فعال نیست.</div>';
+}
+
+async function startReplyChain(){
+  const chat = cleanPeerInput(document.getElementById('repChat').value);
+  const msgId = parseInt(document.getElementById('repMsgId').value || '0', 10);
+  const text = document.getElementById('repText').value.trim();
+  const speed = document.getElementById('repSpeed').value || 700;
+  const count = document.getElementById('repCount').value || 0;
+  const msgEl = document.getElementById('repMsg');
+  if(!chat || !msgId){ msgEl.innerText = 'چت و شماره پیام هدف را وارد کن.'; return; }
+  if(!text){ msgEl.innerText = 'متن ریپلای را وارد کن.'; return; }
+  const q = `?mode=reply_chain&targets=${encodeURIComponent(chat)}&reply_to_msg_id=${msgId}&msg_id=${msgId}&payload=${encodeURIComponent(text)}&speed_ms=${speed}&max_count=${count}`;
+  const d = await api('/api/add_job', q);
+  msgEl.innerText = (d && d.msg) || 'انجام شد';
+  poll();
+}
+
+async function fetchFwdMsg(){
+  const link = document.getElementById('fwdLink').value.trim();
+  const msgEl = document.getElementById('fwdMsg');
+  if(!link){ msgEl.innerText = 'لینک پیام را وارد کن.'; return; }
+  fwdConfirmed = null;
+  msgEl.innerText = 'در حال پیدا کردن کانال و خواندن پیام...';
+  const d = await api('/api/fetch_msg', '?link=' + encodeURIComponent(link));
+  if(!d || !d.ok){
+    msgEl.innerText = (d && d.msg) || 'خطا در خواندن پیام';
+    return;
+  }
+  fwdDraft = d;
+  const box = document.getElementById('fwdBox');
+  box.style.display = 'block';
+  box.className = 'preview';
+  const ch = d.channel_name ? `${d.channel_name} (${d.chat_id})` : d.chat_id;
+  document.getElementById('fwdMeta').innerText = `کانال: ${ch} | پیام: #${d.msg_id} | وضعیت: ${d.source_label || '-'}`;
+  document.getElementById('fwdText').value = d.text || '';
+  document.getElementById('fwdConfirmBtn').innerText = 'تأیید پیام';
+  document.getElementById('fwdPicked').innerText = 'وضعیت پیام: بررسی کن و روی «تأیید پیام» بزن.';
+  msgEl.innerText = d.note || '';
+}
+
+function confirmFwdMsg(){
+  if(!fwdDraft) return;
+  fwdConfirmed = {
+    chat_id: fwdDraft.chat_id || '',
+    msg_id: fwdDraft.msg_id || 0,
+    link: fwdDraft.link || '',
+    text: document.getElementById('fwdText').value || ''
+  };
+  document.getElementById('fwdBox').className = 'preview ok';
+  document.getElementById('fwdConfirmBtn').innerText = 'تأیید شد ✓';
+  document.getElementById('fwdPicked').innerText = `وضعیت پیام: تأیید شد (#${fwdConfirmed.msg_id})`;
+}
+
+async function startForwardJob(){
+  const msgEl = document.getElementById('fwdMsg');
+  if(!fwdConfirmed){
+    msgEl.innerText = 'ابتدا «بیار پیام» و بعد «تأیید پیام» را بزن.';
+    return;
+  }
+  const text = (document.getElementById('fwdText').value || fwdConfirmed.text || '').trim();
+  const arr = getTargetsArray('fwd');
+  if(!text){ msgEl.innerText = 'متن پیام خالی است.'; return; }
+  if(!arr.length){ msgEl.innerText = 'مقصد را وارد کن.'; return; }
+  if(arr.length > 3){ msgEl.innerText = 'فقط تا ۳ مقصد مجاز است.'; return; }
+  const speed = document.getElementById('fwdSpeed').value || 800;
+  const cnt = document.getElementById('fwdCount').value || 0;
+  const q = `?mode=forward&source_chat=${encodeURIComponent(fwdConfirmed.chat_id)}&msg_id=${encodeURIComponent(fwdConfirmed.msg_id)}&link=${encodeURIComponent(fwdConfirmed.link)}&payload=${encodeURIComponent(text)}&targets=${encodeURIComponent(arr.join(','))}&speed_ms=${speed}&max_count=${cnt}`;
+  const d = await api('/api/add_job', q);
+  msgEl.innerText = (d && d.msg) || 'پاسخی از سرور نیامد.';
+  poll();
+}
+
+async function startSpamJob(){
+  const text = document.getElementById('spamText').value.trim();
+  const arr = getTargetsArray('spam');
+  const speed = document.getElementById('spamSpeed').value || 500;
+  const cnt = document.getElementById('spamCount').value || 0;
+  const re = document.getElementById('spamRestEvery').value || 0;
+  const rm = document.getElementById('spamRestMs').value || 2000;
+  const msgEl = document.getElementById('spamMsg');
+
+  if(!text || !arr.length){
+    msgEl.innerText = 'متن اسپم و مقصد را وارد کنید.';
+    return;
+  }
+  if(arr.length > 3){
+    msgEl.innerText = 'فقط تا ۳ مقصد مجاز است.';
+    return;
+  }
+
+  const q = `?mode=spam&payload=${encodeURIComponent(text)}&targets=${encodeURIComponent(arr.join(','))}&speed_ms=${speed}&max_count=${cnt}&rest_every=${re}&rest_ms=${rm}`;
+  const d = await api('/api/add_job', q);
+  msgEl.innerText = (d && d.msg) || 'پاسخی از سرور نیامد.';
+  poll();
+}
+
+function renderAccounts(){
+  document.getElementById('sAcc').innerText = accounts.length;
+  document.getElementById('accList').innerHTML = accounts.length ? accounts.map((a,i) =>
+    `<div class="chip"><span>${a.name||a.phone} <small style="color:#10b981">(متصل)</small></span><button class="btn br" onclick="delAcc(${i})">حذف</button></div>`
+  ).join('') : '<div class="msg">اکانتی ثبت نشده است.</div>';
+}
+
+function renderTasks(){
+  let ok=0, run=0, fail=0;
+  tasks.forEach(t=>{ ok+=(t.ok||0); fail+=(t.fail||0); if(t.running) run++; });
+  document.getElementById('sOk').innerText = ok;
+  document.getElementById('sRun').innerText = run;
+  document.getElementById('sRun3').innerText = `${run} / 3`;
+  document.getElementById('sFail').innerText = fail;
+
+  document.getElementById('taskList').innerHTML = tasks.length ? tasks.map(t =>
+    `<div class="item">
+      <b>#${t.id}</b> [${t.mode||'spam'}] | وضعیت: <b>${t.running?'ران':'متوقف'}</b>${t.last_error ? ` | <span class="warn">${t.last_error}</span>` : ''}<br>
+      مقصد: ${(t.targets||[]).join('، ')}${t.reply_to_msg_id ? ` | پیام هدف: #${t.reply_to_msg_id}` : ''} | موفق: ${t.ok||0} | ناموفق: ${t.fail||0}
+      <div class="row">
+        <button class="btn bw" onclick="ctrlTask('${t.id}','toggle')">${t.running?'توقف':'ری‌استارت'}</button>
+        <button class="btn br" onclick="ctrlTask('${t.id}','delete')">حذف</button>
+      </div>
+      <div class="log">${(t.logs||[]).slice(-6).join('\n') || 'waiting...'}</div>
+    </div>`
+  ).join('') : '<div class="msg">تسکی ثبت نشده است.</div>';
+}
+
+async function api(path, q=''){
+  if(!baseUrl) return null;
+  const r = await fetch(baseUrl + path + q);
+  return await r.json();
+}
+async function sendPhone(){
+  const p = document.getElementById('phone').value.trim();
+  if(!p || !baseUrl) return;
+  document.getElementById('codeBox').style.display = 'block';
+  document.getElementById('authMsg').innerText = 'در حال ارسال کد...';
+  const d = await api('/api/send_phone', '?phone='+encodeURIComponent(p));
+  if(d && d.auth_msg) document.getElementById('authMsg').innerText = d.auth_msg;
+}
+async function verifyCode(){
+  const c = document.getElementById('code').value.trim();
+  if(!c || !baseUrl) return;
+  const d = await api('/api/verify_code', '?code='+encodeURIComponent(c));
+  if(d && d.auth_msg) document.getElementById('authMsg').innerText = d.auth_msg;
+  poll();
+}
+async function delAcc(i){ await api('/api/del_account', '?index='+i); poll(); }
+async function fetchGroups(openBox=false, prefix=activePickerMode){
+  if(!baseUrl) return;
+  activePickerMode = prefix;
+  const d = await api('/api/groups');
+  if(Array.isArray(d)){
+    chats = d;
+    document.getElementById('sGrp').innerText = chats.length;
+    renderGroupList(prefix);
+    if(openBox){
+      const mapBox = { fwd: 'fwdDstBox', spam: 'spamDstBox', offline: 'offlineDstBox' };
+      document.getElementById(mapBox[prefix]).style.display = 'block';
+    }
+  }
+}
+async function ctrlTask(id, act){ await api('/api/job_ctrl', `?id=${encodeURIComponent(id)}&act=${encodeURIComponent(act)}`); poll(); }
+function logoutApp(){ if(window.AndroidBridge) window.AndroidBridge.logout(); }
+
+async function poll(){
+  renderTags('fwd');
+  renderTags('spam');
+  renderOfflineSelectedUsers();
+  renderOfflineRules();
+  renderEnemyList();
+  try{
+    const d = await api('/api/state');
+    if(!d || d.ok === false) return;
+    const statusLabel = d.kicked_out ? 'خارج شده از اکانت!' : (d.soroush_connected ? 'سروش وصل' : 'سرور وصل');
+    document.getElementById('sysInfo').innerText = `${statusLabel} | پینگ: ${d.ping||'12 ms'} | CPU: ${d.cpu||'0'}% | RAM: ${d.ram||'0'}%`;
+    if(d.auth_msg){
+      const el = document.getElementById('authMsg');
+      el.innerText = d.auth_msg;
+      el.className = 'msg' + (d.kicked_out ? ' warn' : '');
+    }
+    if(Array.isArray(d.accounts)) accounts = d.accounts;
+    if(Array.isArray(d.groups)){
+      chats = d.groups;
+      document.getElementById('sGrp').innerText = chats.length;
+      renderGroupList(activePickerMode);
+    }
+    if(Array.isArray(d.jobs)) tasks = d.jobs;
+    if(Array.isArray(d.offline_rules)) offlineRules = d.offline_rules;
+    if(Array.isArray(d.enemy_rules)) enemies = d.enemy_rules;
+    renderAccounts(); renderTasks(); renderOfflineRules(); renderEnemyList();
+  }catch(e){
+    document.getElementById('sysInfo').innerText = 'سرور در حال اتصال مجدد...';
+  }
+}
+setInterval(poll, 2500);
+poll();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(PANEL_HTML)
 
 
 loaded_jobs = load_jobs()
