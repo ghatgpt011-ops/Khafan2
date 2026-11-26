@@ -689,6 +689,23 @@ async def do_send_code(phone):
     state["kicked_out"] = False
     state["auth_msg"] = "در حال ارسال کد..."
 
+    if not any(a.get("key") == acc_key for a in accounts):
+        accounts.append({
+            "key": acc_key,
+            "phone": phone,
+            "name": phone,
+            "session": "",
+            "connected": False,
+            "kicked": False,
+        })
+    else:
+        for a in accounts:
+            if a.get("key") == acc_key:
+                a["phone"] = phone or a.get("phone") or acc_key
+                a["kicked"] = False
+
+    emit_soroush_event(f"شماره {phone} ثبت شد")
+
     if not SoroushClient or not StringSession:
         state["auth_msg"] = "کتابخانه splusthon روی سرور نصب نیست."
         return
