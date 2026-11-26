@@ -26,7 +26,7 @@ SESSIONS_FILE = "soroush_sessions.json"
 JOBS_FILE = "fonex_jobs.json"
 ENEMIES_FILE = "fonex_enemies.json"
 GROUPS_CACHE_FILE = "fonex_groups_cache.json"
-MAX_ACTIVE_JOBS = 3
+MAX_ACTIVE_JOBS = 5
 MAX_TARGETS_PER_JOB = 3
 
 KICK_KEYWORDS = (
