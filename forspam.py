@@ -497,8 +497,7 @@ def run_async(coro):
 
 def schedule_bg(coro):
     try:
-        fut = run_async(coro)
-        return fut
+        return run_async(coro)
     except Exception:
         return None
 
@@ -723,7 +722,10 @@ async def do_verify_code(code):
         state["soroush_connected"] = True
         state["healer_status"] = "متصل به سروش"
         state["auth_msg"] = f"اکانت {name} متصل شد."
-        asyncio.create_task(refresh_groups(acc_key, force_alive=False))
+        try:
+            await refresh_groups(acc_key, force_alive=False)
+        except Exception:
+            pass
     except Exception as e:
         state["auth_msg"] = f"خطا در تأیید کد: {e}"
 
