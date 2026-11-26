@@ -134,6 +134,23 @@ def add_log(job, text):
     job["logs"] = logs[-30:]
 
 
+def parse_multi_texts(raw_val):
+    if isinstance(raw_val, list):
+        return [str(x).strip() for x in raw_val if str(x).strip()]
+    s = str(raw_val or "").strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        try:
+            arr = json.loads(s)
+            if isinstance(arr, list):
+                return [str(x).strip() for x in arr if str(x).strip()]
+        except Exception:
+            pass
+    parts = [p.strip() for p in re.split(r"\n?\|\|\|\n?", s) if p.strip()]
+    return parts if parts else [s]
+
+
 def save_sessions():
     try:
         payload = {
@@ -210,6 +227,10 @@ def load_jobs():
                         j["mode"] = mode
                         j["acc_key"] = norm_acc_key(j.get("acc_key") or "") or default_key
                         j["targets"] = (j.get("targets") or [])[:MAX_TARGETS_PER_JOB]
+                        texts = parse_multi_texts(j.get("texts") or j.get("payload") or "")
+                        j["texts"] = texts
+                        j["payload"] = texts[0] if texts else str(j.get("payload") or "")
+                        j.setdefault("text_idx", 0)
                         j.setdefault("reply_to_msg_id", 0)
                         j.setdefault("t_idx", 0)
                         j.setdefault("sent_burst", 0)
@@ -243,6 +264,10 @@ def load_enemies():
                 if isinstance(arr, list):
                     for er in arr:
                         if isinstance(er, dict):
+                            r_texts = parse_multi_texts(er.get("reply_texts") or er.get("reply_text") or "")
+                            er["reply_texts"] = r_texts
+                            er["reply_text"] = r_texts[0] if r_texts else str(er.get("reply_text") or "")
+                            er.setdefault("reply_idx", 0)
                             cleaned.append(er)
         except Exception:
             cleaned = []
@@ -500,6 +525,28 @@ def schedule_bg(coro):
         return run_async(coro)
     except Exception:
         return None
+
+
+def pick_next_job_text(job):
+    texts = parse_multi_texts(job.get("texts") or job.get("payload") or "")
+    if not texts:
+        return str(job.get("payload") or "")
+    idx = int(job.get("text_idx") or 0) % len(texts)
+    chosen = texts[idx]
+    job["text_idx"] = (idx + 1) % len(texts)
+    job["payload"] = chosen
+    return chosen
+
+
+def pick_next_enemy_text(er):
+    texts = parse_multi_texts(er.get("reply_texts") or er.get("reply_text") or "")
+    if not texts:
+        return str(er.get("reply_text") or "")
+    idx = int(er.get("reply_idx") or 0) % len(texts)
+    chosen = texts[idx]
+    er["reply_idx"] = (idx + 1) % len(texts)
+    er["reply_text"] = chosen
+    return chosen
 
 
 async def refresh_groups(acc_key="", force_alive=True):
@@ -882,14 +929,14 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
     raise last_err if last_err else RuntimeError("ریپلای ارسال نشد.")
 
 
-async def execute_job_step(job, raw_target):
+async def execute_job_step(job, raw_target, pre_text=None):
     acc_key = job.get("acc_key") or resolve_acc_key("")
     c = get_acc_client(acc_key)
     if not is_acc_ready(acc_key) or c is None:
         raise RuntimeError("اکانت متصل نیست.")
 
     mode = job.get("mode") or "spam"
-    payload = str(job.get("payload") or "")
+    payload = str(pre_text if pre_text is not None else (job.get("payload") or ""))
     dst_cands = peer_candidates(raw_target)
     if not dst_cands:
         raise ValueError("مقصد نامعتبر است.")
@@ -968,7 +1015,7 @@ async def execute_job_step(job, raw_target):
     raise last_err if last_err else RuntimeError("ارسال اسپم ناموفق بود.")
 
 
-async def smart_heal(job, raw_target, err):
+async def smart_heal(job, raw_target, err, chosen_text=""):
     acc_key = job.get("acc_key") or resolve_acc_key("")
     if is_kicked_error(err):
         mark_account_kicked(acc_key, str(err)[:80])
@@ -981,7 +1028,7 @@ async def smart_heal(job, raw_target, err):
     normalized = clean_target(raw_target)
     if normalized:
         try:
-            await execute_job_step(job, normalized)
+            await execute_job_step(job, normalized, pre_text=chosen_text)
             job["heal_state"] = "resumed"
             job["last_error"] = ""
             add_log(job, f"FIXED & RESUMED -> {normalized}")
@@ -995,7 +1042,7 @@ async def smart_heal(job, raw_target, err):
     reconnected = await connect_single_account(acc_obj) if acc_obj else False
     if reconnected:
         try:
-            await execute_job_step(job, normalized or raw_target)
+            await execute_job_step(job, normalized or raw_target, pre_text=chosen_text)
             job["heal_state"] = "resumed"
             job["last_error"] = ""
             add_log(job, f"RECONNECTED & RESUMED -> {normalized or raw_target}")
@@ -1041,10 +1088,11 @@ async def run_job_worker(job):
 
         idx = int(job.get("t_idx") or 0) % len(targets)
         current_target = targets[idx]
+        chosen_text = pick_next_job_text(job)
 
         async with op_lock:
             try:
-                await execute_job_step(job, current_target)
+                await execute_job_step(job, current_target, pre_text=chosen_text)
                 job["ok"] = int(job.get("ok") or 0) + 1
                 job["t_idx"] = (idx + 1) % len(targets)
                 job["sent_burst"] = int(job.get("sent_burst") or 0) + 1
@@ -1052,7 +1100,7 @@ async def run_job_worker(job):
                 job["last_error"] = ""
             except Exception as e:
                 err_txt = str(e)
-                healed = await smart_heal(job, current_target, e)
+                healed = await smart_heal(job, current_target, e, chosen_text=chosen_text)
                 if healed:
                     job["ok"] = int(job.get("ok") or 0) + 1
                     job["t_idx"] = (idx + 1) % len(targets)
@@ -1116,7 +1164,8 @@ async def poll_enemy_rules():
                     if u_match:
                         async with op_lock:
                             try:
-                                await send_reply_message(c, [p], er.get("reply_text") or "", mid)
+                                next_reply = pick_next_enemy_text(er)
+                                await send_reply_message(c, [p], next_reply, mid)
                                 seen_ids.add(mid)
                                 er["replied_msg_ids"] = list(seen_ids)[-80:]
                                 er["replied_count"] = int(er.get("replied_count") or 0) + 1
@@ -1336,13 +1385,13 @@ def api_add_enemy():
     chat_id = clean_target(request.args.get("chat_id") or "")
     user_id = (request.args.get("user_id") or "").strip()
     user_name = (request.args.get("user_name") or user_id).strip()
-    reply_text = (request.args.get("reply_text") or "").strip()
+    reply_texts = parse_multi_texts(request.args.get("reply_texts") or request.args.get("reply_text") or "")
     max_count = max(0, int(request.args.get("max_count") or 0))
 
     if not chat_id or not user_id:
         return jsonify({"ok": False, "msg": "ابتدا با لینک پیام، کاربر را در چت شناسایی کنید."})
-    if not reply_text:
-        return jsonify({"ok": False, "msg": "متن ریپلای دشمن را وارد کنید."})
+    if not reply_texts:
+        return jsonify({"ok": False, "msg": "حداقل یک متن ریپلای دشمن وارد کنید."})
 
     enemy_seq += 1
     er = {
@@ -1352,7 +1401,9 @@ def api_add_enemy():
         "chat_id": chat_id,
         "user_id": user_id,
         "user_name": user_name,
-        "reply_text": reply_text,
+        "reply_texts": reply_texts,
+        "reply_text": reply_texts[0],
+        "reply_idx": 0,
         "max_count": max_count,
         "replied_count": 0,
         "replied_msg_ids": [],
@@ -1363,7 +1414,7 @@ def api_add_enemy():
     }
     enemy_rules.append(er)
     save_enemies()
-    return jsonify({"ok": True, "msg": f"دشمن «{user_name}» برای اکانت {get_acc_label(acc_key)} ثبت شد."})
+    return jsonify({"ok": True, "msg": f"دشمن «{user_name}» ({len(reply_texts)} متن) برای اکانت {get_acc_label(acc_key)} ثبت شد."})
 
 
 @app.route("/api/enemy_ctrl")
@@ -1395,7 +1446,8 @@ def api_add_job():
     if mode not in ("spam", "forward", "reply_chain"):
         mode = "spam"
 
-    payload = request.args.get("payload") or ""
+    texts = parse_multi_texts(request.args.get("texts") or request.args.get("payload") or "")
+    payload = texts[0] if texts else (request.args.get("payload") or "")
     raw_link = (request.args.get("link") or "").strip()
     raw_targets = (request.args.get("targets") or "").strip()
     reply_to_msg_id = int(request.args.get("reply_to_msg_id") or request.args.get("msg_id") or 0)
@@ -1431,7 +1483,9 @@ def api_add_job():
         "msg_id": int(request.args.get("msg_id") or reply_to_msg_id or 0),
         "reply_to_msg_id": reply_to_msg_id,
         "link": raw_link,
+        "texts": texts if texts else [payload],
         "payload": payload,
+        "text_idx": 0,
         "targets": targets,
         "t_idx": 0,
         "sent_burst": 0,
