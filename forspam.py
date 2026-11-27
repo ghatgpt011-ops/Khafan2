@@ -29,22 +29,15 @@ GROUPS_CACHE_FILE = "fonex_groups_cache.json"
 MAX_ACTIVE_JOBS = 5
 MAX_TARGETS_PER_JOB = 3
 
+# فقط خطاهای واقعی نشست/سشن، نه خطاهای معمولی شبکه یا سرور
 KICK_KEYWORDS = (
-    "session",
-    "auth",
-    "unauth",
-    "revok",
-    "terminat",
-    "log out",
+    "session_revoked",
+    "auth_key_unregistered",
+    "session expired",
+    "session_expired",
+    "user_deactivated",
     "logged out",
-    "logout",
-    "invalid",
-    "expired",
-    "401",
-    "403",
-    "خروج",
-    "منقضی",
-    "نامعتبر",
+    "log out",
 )
 
 app = Flask(__name__)
@@ -141,7 +134,7 @@ def add_log(job, text):
     if not isinstance(logs, list):
         logs = []
     logs.append(f"[{now_str()}] {text}")
-    job["logs"] = logs[-30:]
+    job["logs"] = logs[-35:]
 
 
 def parse_multi_texts(raw_val):
@@ -244,6 +237,9 @@ def load_jobs():
                         j.setdefault("reply_to_msg_id", 0)
                         j.setdefault("t_idx", 0)
                         j.setdefault("sent_burst", 0)
+                        j.setdefault("speed_ms", 500)
+                        j.setdefault("last_step_ms", 0)
+                        j.setdefault("effective_delay_ms", int(j.get("speed_ms") or 500))
                         j.setdefault("heal_state", "normal")
                         j.setdefault("last_error", "")
                         j.setdefault("ok", 0)
@@ -278,6 +274,8 @@ def load_enemies():
                             er["reply_texts"] = r_texts
                             er["reply_text"] = r_texts[0] if r_texts else str(er.get("reply_text") or "")
                             er.setdefault("reply_idx", 0)
+                            er.setdefault("speed_ms", 350)
+                            er.setdefault("last_step_ms", 0)
                             cleaned.append(er)
         except Exception:
             cleaned = []
@@ -464,7 +462,7 @@ def get_sender_info(msg_obj):
     return uid, (uname or uid)
 
 
-async def maybe_await(res, timeout=10):
+async def maybe_await(res, timeout=14):
     if asyncio.iscoroutine(res):
         return await asyncio.wait_for(res, timeout=timeout)
     return res
@@ -572,7 +570,7 @@ async def refresh_groups(acc_key="", force_alive=True):
         c = get_acc_client(target_key)
         if not c or not hasattr(c, "get_dialogs"):
             return groups_by_acc.get(target_key, [])
-        dialogs = await maybe_await(c.get_dialogs(limit=100), timeout=6)
+        dialogs = await maybe_await(c.get_dialogs(limit=100), timeout=8)
         items = []
         seen = set()
         for d in list(dialogs or []):
@@ -605,37 +603,43 @@ async def connect_single_account(acc_obj, force_new=False):
     prev = clients_by_acc.get(acc_key, {}).get("client")
     if prev is not None and hasattr(prev, "disconnect"):
         try:
-            await maybe_await(prev.disconnect(), timeout=3)
+            await maybe_await(prev.disconnect(), timeout=4)
         except Exception:
             pass
 
-    try:
-        c = SoroushClient(StringSession(sess)) if sess else SoroushClient(StringSession())
-        t0 = time.perf_counter()
-        await maybe_await(c.connect(), timeout=12)
-        if sess and hasattr(c, "get_me"):
-            me = await maybe_await(c.get_me(), timeout=5)
-            if me is None:
-                mark_account_kicked(acc_key, "سشن نامعتبر است.")
+    for attempt in range(2):
+        try:
+            c = SoroushClient(StringSession(sess)) if sess else SoroushClient(StringSession())
+            t0 = time.perf_counter()
+            await maybe_await(c.connect(), timeout=15)
+            if sess and hasattr(c, "get_me"):
+                me = await maybe_await(c.get_me(), timeout=7)
+                if me is None and attempt == 0:
+                    await asyncio.sleep(0.5)
+                    continue
+                name = getattr(me, "first_name", None) or acc_obj.get("name") or acc_obj.get("phone") or acc_key
+                acc_obj["name"] = str(name)
+            acc_obj["connected"] = True
+            acc_obj["kicked"] = False
+            clients_by_acc[acc_key] = {"client": c, "ready": True if sess else False}
+            if acc_key == active_acc_key:
+                state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
+                state["kicked_out"] = False
+                state["soroush_connected"] = bool(sess)
+                state["healer_status"] = "متصل به سروش (قوی)" if sess else "در انتظار ورود"
+            if sess:
+                emit_soroush_event(f"سروش به پنل متصل شد ({acc_obj.get('name') or acc_key})")
+                asyncio.create_task(refresh_groups(acc_key, force_alive=False))
+            return True
+        except Exception as e:
+            if is_kicked_error(e):
+                mark_account_kicked(acc_key, str(e)[:80])
                 return False
-            name = getattr(me, "first_name", None) or acc_obj.get("name") or acc_obj.get("phone") or acc_key
-            acc_obj["name"] = str(name)
-        acc_obj["connected"] = True
-        acc_obj["kicked"] = False
-        clients_by_acc[acc_key] = {"client": c, "ready": True if sess else False}
-        if acc_key == active_acc_key:
-            state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
-            state["kicked_out"] = False
-            state["soroush_connected"] = bool(sess)
-            state["healer_status"] = "متصل به سروش" if sess else "در انتظار ورود"
-        if sess:
-            emit_soroush_event(f"سروش به پنل متصل شد ({acc_obj.get('name') or acc_key})")
-            asyncio.create_task(refresh_groups(acc_key, force_alive=False))
-        return True
-    except Exception as e:
-        if is_kicked_error(e):
-            mark_account_kicked(acc_key, str(e)[:80])
-        return False
+            if attempt == 0:
+                await asyncio.sleep(0.6)
+                continue
+            return False
+    return False
 
 
 async def ensure_accounts_connected():
@@ -660,29 +664,33 @@ async def check_acc_alive(acc_key):
         return True
     try:
         t0 = time.perf_counter()
-        me = await maybe_await(c.get_me(), timeout=4)
+        me = await maybe_await(c.get_me(), timeout=6)
         if acc_key == active_acc_key:
             state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
-        if me is None:
-            mark_account_kicked(acc_key, "پاسخ get_me خالی است.")
-            return False
-        for a in accounts:
-            if a.get("key") == acc_key:
-                a["connected"] = True
-                a["kicked"] = False
-        if acc_key == active_acc_key:
-            state["kicked_out"] = False
-            state["soroush_connected"] = True
-            state["healer_status"] = "متصل به سروش"
+        if me is not None:
+            for a in accounts:
+                if a.get("key") == acc_key:
+                    a["connected"] = True
+                    a["kicked"] = False
+            if acc_key == active_acc_key:
+                state["kicked_out"] = False
+                state["soroush_connected"] = True
+                state["healer_status"] = "متصل به سروش (قوی)"
         return True
     except Exception as e:
         if is_kicked_error(e):
             mark_account_kicked(acc_key, str(e)[:80])
-        return False
+            return False
+        # در صورت خطای موقت شبکه، سریع دوباره وصل شو و اکانت را از کار نینداز
+        acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
+        if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+            asyncio.create_task(connect_single_account(acc_obj))
+        return True
 
 
 async def do_send_code(phone):
     global active_acc_key
+    phone = str(phone or "").strip()
     acc_key = norm_acc_key(phone) or f"acc_{len(accounts)+1}"
     active_acc_key = acc_key
     state["phone"] = phone
@@ -710,36 +718,61 @@ async def do_send_code(phone):
         state["auth_msg"] = "کتابخانه splusthon روی سرور نصب نیست."
         return
 
-    try:
-        prev = clients_by_acc.get(acc_key, {}).get("client")
-        if prev is not None and hasattr(prev, "disconnect"):
-            try:
-                await maybe_await(prev.disconnect(), timeout=3)
-            except Exception:
-                pass
+    last_err = None
+    for attempt in range(3):
+        try:
+            prev = clients_by_acc.get(acc_key, {}).get("client")
+            if prev is not None and hasattr(prev, "disconnect"):
+                try:
+                    await maybe_await(prev.disconnect(), timeout=4)
+                except Exception:
+                    pass
 
-        c = SoroushClient(StringSession())
-        clients_by_acc[acc_key] = {"client": c, "ready": False}
-        await maybe_await(c.connect(), timeout=12)
+            c = SoroushClient(StringSession())
+            clients_by_acc[acc_key] = {"client": c, "ready": False}
+            await maybe_await(c.connect(), timeout=16)
 
-        if hasattr(c, "send_code_request"):
-            res = await maybe_await(c.send_code_request(phone), timeout=12)
-        elif hasattr(c, "send_code"):
-            res = await maybe_await(c.send_code(phone), timeout=12)
-        else:
-            res = await maybe_await(c.sign_in(phone=phone), timeout=12)
+            res = None
+            sent_ok = False
+            for fn_call in (
+                lambda: c.send_code_request(phone) if hasattr(c, "send_code_request") else None,
+                lambda: c.send_code(phone) if hasattr(c, "send_code") else None,
+                lambda: c.sign_in(phone=phone) if hasattr(c, "sign_in") else None,
+            ):
+                coro = fn_call()
+                if coro is not None:
+                    try:
+                        res = await maybe_await(coro, timeout=16)
+                        sent_ok = True
+                        break
+                    except TypeError:
+                        continue
 
-        pending_auth_by_acc[acc_key] = {
-            "phone": phone,
-            "phone_code_hash": getattr(res, "phone_code_hash", None),
-        }
-        state["auth_msg"] = f"کد برای {phone} ارسال شد؛ کد را وارد کنید."
-    except Exception as e:
-        state["auth_msg"] = f"خطا در ارسال کد: {e}"
+            if not sent_ok:
+                raise RuntimeError("متد ارسال کد در splusthon یافت نشد.")
+
+            code_hash = getattr(res, "phone_code_hash", None)
+            if not code_hash and isinstance(res, dict):
+                code_hash = res.get("phone_code_hash")
+
+            pending_auth_by_acc[acc_key] = {
+                "phone": phone,
+                "phone_code_hash": code_hash,
+            }
+            state["auth_msg"] = f"کد برای {phone} ارسال شد؛ کد را وارد کنید."
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                await asyncio.sleep(0.8)
+                continue
+
+    state["auth_msg"] = f"خطا در ارسال کد: {last_err or 'عدم پاسخ سرور'}"
 
 
 async def do_verify_code(code):
     global active_acc_key
+    code = str(code or "").strip()
     acc_key = active_acc_key or norm_acc_key(state.get("phone"))
     pend = pending_auth_by_acc.get(acc_key) or {}
     phone = pend.get("phone") or state.get("phone", "").strip()
@@ -749,22 +782,37 @@ async def do_verify_code(code):
     try:
         c = get_acc_client(acc_key)
         if not c:
-            raise RuntimeError("کلاینت آماده نیست.")
+            if SoroushClient and StringSession:
+                c = SoroushClient(StringSession())
+                clients_by_acc[acc_key] = {"client": c, "ready": False}
+                await maybe_await(c.connect(), timeout=15)
+            else:
+                raise RuntimeError("کلاینت آماده نیست.")
 
         signed = False
+        attempts = []
         if phone_code_hash:
-            for fn in (
+            attempts.extend([
                 lambda: c.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash),
                 lambda: c.sign_in(phone, code, phone_code_hash),
-            ):
-                try:
-                    await maybe_await(fn(), timeout=12)
-                    signed = True
-                    break
-                except TypeError:
-                    continue
-        if not signed:
-            await maybe_await(c.sign_in(phone=phone, code=code), timeout=12)
+            ])
+        attempts.extend([
+            lambda: c.sign_in(phone=phone, code=code),
+            lambda: c.sign_in(phone, code),
+        ])
+
+        last_type_err = None
+        for fn in attempts:
+            try:
+                await maybe_await(fn(), timeout=15)
+                signed = True
+                break
+            except TypeError as te:
+                last_type_err = te
+                continue
+
+        if not signed and last_type_err:
+            raise last_type_err
 
         sess = c.session.save() if getattr(c, "session", None) else ""
         clients_by_acc[acc_key] = {"client": c, "ready": True}
@@ -772,7 +820,7 @@ async def do_verify_code(code):
 
         name = phone
         try:
-            me = await maybe_await(c.get_me(), timeout=4)
+            me = await maybe_await(c.get_me(), timeout=6)
             if me and getattr(me, "first_name", None):
                 name = str(me.first_name)
         except Exception:
@@ -802,7 +850,7 @@ async def do_verify_code(code):
         save_sessions()
         state["kicked_out"] = False
         state["soroush_connected"] = True
-        state["healer_status"] = "متصل به سروش"
+        state["healer_status"] = "متصل به سروش (قوی)"
         state["auth_msg"] = f"اکانت {name} متصل شد."
         emit_soroush_event(f"اکانت {name} به سروش وصل شد")
         try:
@@ -823,7 +871,7 @@ async def find_channel_in_dialogs(acc_key, raw_chat):
 
     if is_acc_ready(acc_key) and c is not None and hasattr(c, "get_dialogs"):
         try:
-            dlgs = await maybe_await(c.get_dialogs(limit=100), timeout=7)
+            dlgs = await maybe_await(c.get_dialogs(limit=100), timeout=8)
             for d in list(dlgs or []):
                 entity = getattr(d, "entity", None) or d
                 did_str = str(getattr(d, "id", None) or getattr(entity, "id", None) or "").strip()
@@ -862,7 +910,7 @@ async def fetch_single_message(acc_key, raw_chat, msg_id):
 
     for peer in peer_cands:
         try:
-            res = await maybe_await(c.get_messages(peer, ids=int(msg_id)), timeout=6)
+            res = await maybe_await(c.get_messages(peer, ids=int(msg_id)), timeout=7)
             if res is not None:
                 if isinstance(res, (list, tuple)):
                     for item in res:
@@ -878,7 +926,7 @@ async def fetch_single_message(acc_key, raw_chat, msg_id):
 
     for peer in peer_cands:
         try:
-            hist = await maybe_await(c.get_messages(peer, limit=50), timeout=6)
+            hist = await maybe_await(c.get_messages(peer, limit=50), timeout=7)
             if isinstance(hist, (list, tuple)):
                 for item in hist:
                     if get_msg_id_val(item) == int(msg_id):
@@ -944,7 +992,7 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
     for peer in peers:
         for kw_name in ("reply_to", "reply_to_msg_id"):
             try:
-                await maybe_await(c.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=7)
+                await maybe_await(c.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=8)
                 return None
             except TypeError as te:
                 last_err = te
@@ -955,7 +1003,7 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
                     raise
                 break
         try:
-            await maybe_await(c.send_message(peer, text_payload), timeout=7)
+            await maybe_await(c.send_message(peer, text_payload), timeout=8)
             return None
         except Exception as e2:
             last_err = e2
@@ -969,7 +1017,12 @@ async def execute_job_step(job, raw_target, pre_text=None):
     acc_key = job.get("acc_key") or resolve_acc_key("")
     c = get_acc_client(acc_key)
     if not is_acc_ready(acc_key) or c is None:
-        raise RuntimeError("اکانت متصل نیست.")
+        acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
+        if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+            await connect_single_account(acc_obj)
+            c = get_acc_client(acc_key)
+    if not is_acc_ready(acc_key) or c is None:
+        raise RuntimeError("در حال اتصال مجدد به سروش...")
 
     mode = job.get("mode") or "spam"
     payload = str(pre_text if pre_text is not None else (job.get("payload") or ""))
@@ -983,13 +1036,7 @@ async def execute_job_step(job, raw_target, pre_text=None):
             raise ValueError("شناسه پیام ریپلای مشخص نیست.")
         if not payload.strip():
             raise ValueError("متن ریپلای خالی است.")
-        found_cands, _ = await find_channel_in_dialogs(acc_key, raw_target)
-        merged_peers = []
-        for x in (found_cands + dst_cands):
-            if x not in merged_peers:
-                merged_peers.append(x)
-        await fetch_single_message(acc_key, raw_target, reply_msg_id)
-        await send_reply_message(c, merged_peers, payload, reply_msg_id)
+        await send_reply_message(c, dst_cands, payload, reply_msg_id)
         add_log(job, f"REPLY #{reply_msg_id} OK -> {clean_target(raw_target)}")
         return
 
@@ -1051,48 +1098,6 @@ async def execute_job_step(job, raw_target, pre_text=None):
     raise last_err if last_err else RuntimeError("ارسال اسپم ناموفق بود.")
 
 
-async def smart_heal(job, raw_target, err, chosen_text=""):
-    acc_key = job.get("acc_key") or resolve_acc_key("")
-    if is_kicked_error(err):
-        mark_account_kicked(acc_key, str(err)[:80])
-        return False
-
-    job["heal_state"] = "healing"
-    job["last_error"] = str(err)[:90]
-    add_log(job, f"HEAL -> اصلاح خطا و ادامه روی {clean_target(raw_target)}...")
-
-    normalized = clean_target(raw_target)
-    if normalized:
-        try:
-            await execute_job_step(job, normalized, pre_text=chosen_text)
-            job["heal_state"] = "resumed"
-            job["last_error"] = ""
-            add_log(job, f"FIXED & RESUMED -> {normalized}")
-            return True
-        except Exception as e1:
-            if is_kicked_error(e1):
-                mark_account_kicked(acc_key, str(e1)[:80])
-                return False
-
-    acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
-    reconnected = await connect_single_account(acc_obj) if acc_obj else False
-    if reconnected:
-        try:
-            await execute_job_step(job, normalized or raw_target, pre_text=chosen_text)
-            job["heal_state"] = "resumed"
-            job["last_error"] = ""
-            add_log(job, f"RECONNECTED & RESUMED -> {normalized or raw_target}")
-            return True
-        except Exception as e2:
-            if is_kicked_error(e2):
-                mark_account_kicked(acc_key, str(e2)[:80])
-                return False
-            job["last_error"] = str(e2)[:90]
-
-    job["heal_state"] = "normal"
-    return False
-
-
 async def run_job_worker(job):
     while job in jobs:
         if not job.get("running"):
@@ -1101,12 +1106,14 @@ async def run_job_worker(job):
 
         acc_key = job.get("acc_key") or resolve_acc_key("")
         if not is_acc_ready(acc_key):
-            job["running"] = False
-            job["heal_state"] = "kicked"
-            job["last_error"] = "اکانت متصل نیست"
-            add_log(job, "STOP -> اکانت متصل نیست")
-            save_jobs()
-            continue
+            acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
+            if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+                await connect_single_account(acc_obj)
+            if not is_acc_ready(acc_key):
+                job["heal_state"] = "reconnecting"
+                job["last_error"] = "در حال حفظ اتصال با سروش..."
+                await asyncio.sleep(1.0)
+                continue
 
         max_c = int(job.get("max_count") or 0)
         if max_c > 0 and (int(job.get("ok") or 0) + int(job.get("fail") or 0)) >= max_c:
@@ -1125,36 +1132,44 @@ async def run_job_worker(job):
         idx = int(job.get("t_idx") or 0) % len(targets)
         current_target = targets[idx]
         chosen_text = pick_next_job_text(job)
+        configured_delay_ms = max(40, int(job.get("speed_ms") or 500))
+        job["speed_ms"] = configured_delay_ms
 
+        t_start = time.perf_counter()
         async with op_lock:
             try:
                 await execute_job_step(job, current_target, pre_text=chosen_text)
+                step_ms = int((time.perf_counter() - t_start) * 1000)
                 job["ok"] = int(job.get("ok") or 0) + 1
                 job["t_idx"] = (idx + 1) % len(targets)
                 job["sent_burst"] = int(job.get("sent_burst") or 0) + 1
+                job["last_step_ms"] = step_ms
+                job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
                 job["heal_state"] = "running"
                 job["last_error"] = ""
+                add_log(job, f"SPEED -> تنظیم: {configured_delay_ms}ms | اجرا: {step_ms}ms")
             except Exception as e:
+                step_ms = int((time.perf_counter() - t_start) * 1000)
                 err_txt = str(e)
-                healed = await smart_heal(job, current_target, e, chosen_text=chosen_text)
-                if healed:
-                    job["ok"] = int(job.get("ok") or 0) + 1
-                    job["t_idx"] = (idx + 1) % len(targets)
-                    job["sent_burst"] = int(job.get("sent_burst") or 0) + 1
-                else:
-                    job["fail"] = int(job.get("fail") or 0) + 1
-                    job["last_error"] = err_txt[:90]
-                    job["t_idx"] = (idx + 1) % len(targets)
-                    add_log(job, f"ERR -> {err_txt[:75]}")
+                if is_kicked_error(err_txt):
+                    mark_account_kicked(acc_key, err_txt[:80])
+                    continue
+                job["fail"] = int(job.get("fail") or 0) + 1
+                job["last_step_ms"] = step_ms
+                job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
+                job["last_error"] = err_txt[:90]
+                job["t_idx"] = (idx + 1) % len(targets)
+                add_log(job, f"ERR ({step_ms}ms) -> {err_txt[:75]}")
 
         rest_every = int(job.get("rest_every") or 0)
         rest_ms = int(job.get("rest_ms") or 0)
         if rest_every > 0 and rest_ms > 0 and int(job.get("sent_burst") or 0) >= rest_every:
             job["sent_burst"] = 0
+            job["effective_delay_ms"] = max(configured_delay_ms, rest_ms)
             await asyncio.sleep(rest_ms / 1000.0)
             continue
 
-        await asyncio.sleep(max(40, int(job.get("speed_ms") or 500)) / 1000.0)
+        await asyncio.sleep(configured_delay_ms / 1000.0)
 
 
 async def poll_enemy_rules():
@@ -1182,7 +1197,8 @@ async def poll_enemy_rules():
 
         for p in peers:
             try:
-                msgs = await maybe_await(c.get_messages(p, limit=5), timeout=3)
+                t0 = time.perf_counter()
+                msgs = await maybe_await(c.get_messages(p, limit=5), timeout=4)
                 if not isinstance(msgs, (list, tuple)):
                     continue
                 ordered = sorted(
@@ -1202,11 +1218,13 @@ async def poll_enemy_rules():
                             try:
                                 next_reply = pick_next_enemy_text(er)
                                 await send_reply_message(c, [p], next_reply, mid)
+                                step_ms = int((time.perf_counter() - t0) * 1000)
                                 seen_ids.add(mid)
                                 er["replied_msg_ids"] = list(seen_ids)[-80:]
                                 er["replied_count"] = int(er.get("replied_count") or 0) + 1
+                                er["last_step_ms"] = step_ms
                                 er["last_reply_at"] = now_str()
-                                er["status"] = f"ریپلای آنی روی پیام #{mid}"
+                                er["status"] = f"ریپلای آنی روی پیام #{mid} ({step_ms}ms)"
                                 if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
                                     er["running"] = False
                                     er["status"] = "تکمیل شد"
@@ -1229,9 +1247,9 @@ async def watcher_loop():
         await asyncio.sleep(0.35)
         tick += 1
         await poll_enemy_rules()
-        if tick % 20 == 0:
+        if tick % 12 == 0:
             await ensure_accounts_connected()
-        if tick % 35 == 0:
+        if tick % 25 == 0:
             for a in list(accounts):
                 await check_acc_alive(a["key"])
 
@@ -1299,7 +1317,7 @@ def api_soroush_ping():
         fut = run_async(ensure_accounts_connected())
         if fut:
             try:
-                fut.result(timeout=6)
+                fut.result(timeout=7)
             except Exception:
                 pass
     return jsonify({
@@ -1316,7 +1334,7 @@ def api_send_phone():
     fut = run_async(do_send_code(phone))
     if fut:
         try:
-            fut.result(timeout=15)
+            fut.result(timeout=25)
         except Exception:
             pass
     return jsonify({"ok": True, "auth_msg": state["auth_msg"], "active_acc_key": active_acc_key, "event_seq": event_seq})
@@ -1328,7 +1346,7 @@ def api_verify_code():
     fut = run_async(do_verify_code(code))
     if fut:
         try:
-            fut.result(timeout=15)
+            fut.result(timeout=20)
         except Exception:
             pass
     return jsonify({
@@ -1357,7 +1375,7 @@ def api_switch_account():
                 fut = run_async(refresh_groups(key))
                 if fut:
                     try:
-                        fut.result(timeout=5)
+                        fut.result(timeout=6)
                     except Exception:
                         pass
             return jsonify({
@@ -1400,7 +1418,7 @@ def api_groups():
     fut = run_async(refresh_groups(acc_key))
     if fut:
         try:
-            res = fut.result(timeout=6)
+            res = fut.result(timeout=7)
             return jsonify(res if isinstance(res, list) else groups_by_acc.get(acc_key, []))
         except Exception:
             pass
@@ -1416,7 +1434,7 @@ def api_fetch_msg():
     fut = run_async(read_channel_message_from_link(acc_key, link))
     if fut:
         try:
-            return jsonify(fut.result(timeout=10))
+            return jsonify(fut.result(timeout=12))
         except Exception as e:
             return jsonify({"ok": False, "msg": str(e)})
     raw_chat, msg_id, clean_link = parse_splus_link(link)
@@ -1442,7 +1460,7 @@ def api_identify_user():
     fut = run_async(identify_user_from_link(acc_key, link, chat_id))
     if fut:
         try:
-            return jsonify(fut.result(timeout=10))
+            return jsonify(fut.result(timeout=12))
         except Exception as e:
             return jsonify({"ok": False, "msg": str(e)})
     return jsonify({"ok": False, "msg": "خطا در شناسایی کاربر."})
@@ -1460,6 +1478,7 @@ def api_add_enemy():
     user_name = (request.args.get("user_name") or user_id).strip()
     reply_texts = parse_multi_texts(request.args.get("reply_texts") or request.args.get("reply_text") or "")
     max_count = max(0, int(request.args.get("max_count") or 0))
+    speed_ms = max(40, int(request.args.get("speed_ms") or 350))
 
     if not chat_id or not user_id:
         return jsonify({"ok": False, "msg": "ابتدا با لینک پیام، کاربر را در چت شناسایی کنید."})
@@ -1477,6 +1496,8 @@ def api_add_enemy():
         "reply_texts": reply_texts,
         "reply_text": reply_texts[0],
         "reply_idx": 0,
+        "speed_ms": speed_ms,
+        "last_step_ms": 0,
         "max_count": max_count,
         "replied_count": 0,
         "replied_msg_ids": [],
@@ -1515,7 +1536,16 @@ def api_add_job():
     global job_seq
     acc_key = resolve_acc_key(request.args.get("acc_key") or "")
     if not is_acc_ready(acc_key):
-        return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست یا از سشن خارج شده است."})
+        acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
+        if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+            fut = run_async(connect_single_account(acc_obj))
+            if fut:
+                try:
+                    fut.result(timeout=8)
+                except Exception:
+                    pass
+    if not is_acc_ready(acc_key):
+        return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست؛ کمی صبر کن و دوباره بزن."})
 
     mode = (request.args.get("mode") or "spam").strip().lower()
     if mode not in ("spam", "forward", "reply_chain"):
@@ -1549,6 +1579,7 @@ def api_add_job():
 
     job_seq += 1
     acc_label = get_acc_label(acc_key)
+    speed_ms = max(40, int(request.args.get("speed_ms") or 500))
     job = {
         "id": str(100 + job_seq),
         "acc_key": acc_key,
@@ -1564,7 +1595,9 @@ def api_add_job():
         "targets": targets,
         "t_idx": 0,
         "sent_burst": 0,
-        "speed_ms": max(40, int(request.args.get("speed_ms") or 500)),
+        "speed_ms": speed_ms,
+        "last_step_ms": 0,
+        "effective_delay_ms": speed_ms,
         "max_count": max(0, int(request.args.get("max_count") or 0)),
         "rest_every": max(0, int(request.args.get("rest_every") or 0)),
         "rest_ms": max(0, int(request.args.get("rest_ms") or 0)),
@@ -1573,7 +1606,7 @@ def api_add_job():
         "last_error": "",
         "ok": 0,
         "fail": 0,
-        "logs": [f"[{now_str()}] started ({mode}) on {acc_label}"],
+        "logs": [f"[{now_str()}] started ({mode}) on {acc_label} | speed={speed_ms}ms"],
     }
     jobs.append(job)
     save_jobs()
