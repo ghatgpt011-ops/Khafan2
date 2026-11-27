@@ -49,7 +49,6 @@ def _state_path(filename):
 
 SESSIONS_FILE = _state_path("soroush_sessions.json")
 JOBS_FILE = _state_path("fonex_jobs.json")
-ENEMIES_FILE = _state_path("fonex_enemies.json")
 GROUPS_CACHE_FILE = _state_path("fonex_groups_cache.json")
 
 MAX_TOTAL_ACTIVE = 3
@@ -72,12 +71,10 @@ active_acc_key = ""
 
 groups_by_acc = {}
 jobs = []
-enemy_rules = []
 clients_by_acc = {}
 pending_auth_by_acc = {}
 
 job_seq = 100
-enemy_seq = 0
 event_seq = 1
 _refreshing_keys = set()
 
@@ -117,9 +114,7 @@ def emit_soroush_event(notice_text=""):
 
 
 def total_running_count():
-    active_jobs = sum(1 for j in jobs if j.get("running"))
-    active_enemies = sum(1 for e in enemy_rules if e.get("running"))
-    return active_jobs + active_enemies
+    return sum(1 for j in jobs if j.get("running"))
 
 
 def norm_acc_key(val):
@@ -289,7 +284,7 @@ def load_jobs():
             jid_str = str(j.get("id") or "").strip()
             if jid_str.isdigit() and int(jid_str) > max_num:
                 max_num = int(jid_str)
-            mode = j.get("mode") if j.get("mode") in ("spam", "forward") else "spam"
+            mode = j.get("mode") if j.get("mode") in ("spam", "forward", "reply") else "spam"
             j["mode"] = mode
             j["acc_key"] = norm_acc_key(j.get("acc_key") or "") or default_key
             j["targets"] = (j.get("targets") or [])[:MAX_TARGETS_PER_JOB]
@@ -311,35 +306,6 @@ def load_jobs():
                 add_log(j, "RESTORED -> ادامه خودکار پس از ری‌استارت سرور")
             cleaned.append(j)
     job_seq = max(max_num, 100 + len(cleaned))
-    return cleaned
-
-
-def save_enemies():
-    _atomic_write_json(ENEMIES_FILE, enemy_rules)
-
-
-def load_enemies():
-    global enemy_seq
-    cleaned = []
-    max_num = 0
-    arr = _read_json_with_fallback(ENEMIES_FILE, [])
-    if isinstance(arr, list):
-        for er in arr:
-            if isinstance(er, dict):
-                eid_str = str(er.get("id") or "").strip()
-                if eid_str.isdigit() and int(eid_str) > max_num:
-                    max_num = int(eid_str)
-                r_texts = parse_multi_texts(er.get("reply_texts") or er.get("reply_text") or "")
-                er["reply_texts"] = r_texts
-                er["reply_text"] = r_texts[0] if r_texts else str(er.get("reply_text") or "")
-                er.setdefault("reply_idx", 0)
-                er.setdefault("last_step_ms", 0)
-                er.setdefault("replied_msg_ids", [])
-                er.setdefault("last_seen_msg_id", 0)
-                er.setdefault("ok", int(er.get("replied_count") or 0))
-                er.setdefault("fail", 0)
-                cleaned.append(er)
-    enemy_seq = max(max_num, len(cleaned))
     return cleaned
 
 
@@ -484,33 +450,6 @@ def get_msg_id_val(obj):
     return 0
 
 
-def get_sender_info(msg_obj):
-    if msg_obj is None:
-        return "", ""
-    sender = (
-        getattr(msg_obj, "sender", None)
-        or getattr(msg_obj, "from_user", None)
-        or getattr(msg_obj, "user", None)
-    )
-    uid = ""
-    uname = ""
-    for attr in ("sender_id", "from_id", "user_id"):
-        val = getattr(msg_obj, attr, None)
-        if val is not None and str(val).strip():
-            uid = str(val).strip()
-            break
-    if sender is not None:
-        sid = getattr(sender, "id", None)
-        if sid is not None and str(sid).strip():
-            uid = str(sid).strip()
-        first = str(getattr(sender, "first_name", "") or "").strip()
-        last = str(getattr(sender, "last_name", "") or "").strip()
-        u = str(getattr(sender, "username", "") or "").lstrip("@").strip()
-        full = (first + " " + last).strip()
-        uname = full or (f"@{u}" if u else "") or uid
-    return uid, (uname or uid)
-
-
 async def maybe_await(res, timeout=14):
     if asyncio.iscoroutine(res):
         return await asyncio.wait_for(res, timeout=timeout)
@@ -539,16 +478,8 @@ def mark_account_kicked(acc_key, reason="اکانت از سشن خارج شد.")
             j["last_error"] = "خروج از اکانت"
             add_log(j, "KICKED -> متوقف شد (خروج از اکانت)")
             changed = True
-    enemy_changed = False
-    for er in enemy_rules:
-        if er.get("acc_key") == acc_key and er.get("running"):
-            er["running"] = False
-            er["status"] = "خروج از اکانت"
-            enemy_changed = True
     if changed:
         save_jobs()
-    if enemy_changed:
-        save_enemies()
 
     if acc_key == active_acc_key:
         state["soroush_connected"] = False
@@ -593,17 +524,6 @@ def pick_next_job_text(job):
     chosen = texts[idx]
     job["text_idx"] = (idx + 1) % len(texts)
     job["payload"] = chosen
-    return chosen
-
-
-def pick_next_enemy_text(er):
-    texts = parse_multi_texts(er.get("reply_texts") or er.get("reply_text") or "")
-    if not texts:
-        return str(er.get("reply_text") or "")
-    idx = int(er.get("reply_idx") or 0) % len(texts)
-    chosen = texts[idx]
-    er["reply_idx"] = (idx + 1) % len(texts)
-    er["reply_text"] = chosen
     return chosen
 
 
@@ -1060,9 +980,12 @@ async def read_channel_message_from_link(acc_key, link_raw):
     raw_chat, msg_id, clean_link = parse_splus_link(link_raw)
     msg_obj, resolved_chat_id, channel_name = await fetch_single_message(acc_key, raw_chat, msg_id)
     found_text = extract_msg_text(msg_obj)
-    uid, uname = get_sender_info(msg_obj)
     chat_display = channel_name or resolved_chat_id
-    source_label = f"پیام #{msg_id} از چت «{chat_display}» پیدا شد" if found_text else f"پیام #{msg_id} در چت «{chat_display}» (متن را تایید یا تکمیل کنید)"
+    source_label = (
+        f"پیام #{msg_id} از چت «{chat_display}» پیدا شد"
+        if found_text
+        else f"پیام #{msg_id} در چت «{chat_display}» (متن را تایید یا تکمیل کنید)"
+    )
     note = ""
     if not found_text:
         if is_acc_ready(acc_key):
@@ -1075,35 +998,10 @@ async def read_channel_message_from_link(acc_key, link_raw):
         "chat_id": resolved_chat_id,
         "channel_name": chat_display,
         "msg_id": int(msg_id),
-        "user_id": str(uid or ""),
-        "user_name": str(uname or ""),
         "link": clean_link,
         "source_label": source_label,
         "text": found_text,
         "note": note,
-    }
-
-
-async def identify_user_from_link(acc_key, link_raw, forced_chat=""):
-    raw_chat, msg_id, clean_link = parse_splus_link(link_raw)
-    chat_to_use = clean_target(forced_chat) or raw_chat
-    msg_obj, resolved_chat_id, channel_name = await fetch_single_message(acc_key, chat_to_use, msg_id)
-    user_id, user_name = get_sender_info(msg_obj)
-    chat_display = channel_name or resolved_chat_id
-    if not user_id and not user_name:
-        return {
-            "ok": False,
-            "msg": f"کاربر پیام #{msg_id} در چت «{chat_display}» شناسایی نشد.",
-        }
-    return {
-        "ok": True,
-        "chat_id": resolved_chat_id,
-        "channel_name": chat_display,
-        "msg_id": int(msg_id),
-        "user_id": str(user_id or user_name),
-        "user_name": str(user_name or user_id),
-        "link": clean_link,
-        "msg": f"کاربر «{user_name or user_id}» فقط در چت «{chat_display}» هدف قرار گرفت.",
     }
 
 
@@ -1113,7 +1011,7 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
     for peer in peers:
         for kw_name in ("reply_to", "reply_to_msg_id"):
             try:
-                await maybe_await(c.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=2.5)
+                await maybe_await(c.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=7)
                 return None
             except TypeError as te:
                 last_err = te
@@ -1124,7 +1022,7 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
                     raise
                 break
         try:
-            await maybe_await(c.send_message(peer, text_payload), timeout=2.5)
+            await maybe_await(c.send_message(peer, text_payload), timeout=7)
             return None
         except Exception as e2:
             last_err = e2
@@ -1150,6 +1048,14 @@ async def execute_job_step(job, raw_target, pre_text=None):
     dst_cands = peer_candidates(raw_target)
     if not dst_cands:
         raise ValueError("مقصد نامعتبر است.")
+
+    if mode == "reply":
+        reply_msg_id = int(job.get("msg_id") or 0)
+        if reply_msg_id <= 0:
+            raise ValueError("شناسه پیام برای ریپلای معتبر نیست.")
+        await send_reply_message(c, dst_cands, payload, reply_msg_id)
+        add_log(job, f"REPLY OK -> {clean_target(raw_target)} (#{reply_msg_id})")
+        return
 
     if mode == "forward":
         src_cands = peer_candidates(job.get("source_chat")) if job.get("source_chat") else []
@@ -1282,117 +1188,9 @@ async def run_job_worker(job):
         await asyncio.sleep(configured_delay_ms / 1000.0)
 
 
-def _active_peer_for_enemy(er):
-    cached_p = er.get("_fast_peer")
-    if cached_p is not None:
-        return [cached_p]
-    return peer_candidates(er.get("chat_id"))
-
-
-async def _poll_single_enemy(er):
-    if not er.get("running"):
-        return
-    acc_key = er.get("acc_key") or resolve_acc_key("")
-    c = get_acc_client(acc_key)
-    if not is_acc_ready(acc_key) or c is None or not hasattr(c, "get_messages"):
-        return
-
-    max_c = int(er.get("max_count") or 0)
-    if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
-        er["running"] = False
-        er["status"] = "تکمیل شد"
-        return
-
-    peers = _active_peer_for_enemy(er)
-    if not peers:
-        return
-
-    enemy_uid = str(er.get("user_id") or "").strip().lower()
-    enemy_name = str(er.get("user_name") or "").strip().lower()
-    seen_ids = set(er.get("replied_msg_ids") or [])
-    last_seen_id = int(er.get("last_seen_msg_id") or 0)
-
-    for p in peers:
-        try:
-            t0 = time.perf_counter()
-            msgs = await maybe_await(c.get_messages(p, limit=2), timeout=1.5)
-            if not isinstance(msgs, (list, tuple)):
-                continue
-            ordered = sorted(
-                [m for m in msgs if get_msg_id_val(m) > 0],
-                key=lambda x: get_msg_id_val(x),
-            )
-            if not ordered:
-                continue
-
-            er["_fast_peer"] = p
-
-            if last_seen_id == 0:
-                last_seen_id = get_msg_id_val(ordered[-1])
-                er["last_seen_msg_id"] = last_seen_id
-                return
-
-            new_msgs = [m for m in ordered if get_msg_id_val(m) > last_seen_id and get_msg_id_val(m) not in seen_ids]
-            if not new_msgs:
-                return
-
-            er["last_seen_msg_id"] = max(last_seen_id, get_msg_id_val(new_msgs[-1]))
-
-            for m in new_msgs:
-                mid = get_msg_id_val(m)
-                uid, uname = get_sender_info(m)
-                u_match = (enemy_uid and enemy_uid == str(uid).lower()) or (
-                    enemy_name and enemy_name in f"{uid} {uname}".lower()
-                )
-                if u_match:
-                    try:
-                        next_reply = pick_next_enemy_text(er)
-                        await send_reply_message(c, [p], next_reply, mid)
-                        step_ms = int((time.perf_counter() - t0) * 1000)
-                        seen_ids.add(mid)
-                        er["replied_msg_ids"] = list(seen_ids)[-120:]
-                        er["replied_count"] = int(er.get("replied_count") or 0) + 1
-                        er["ok"] = er["replied_count"]
-                        er["last_step_ms"] = step_ms
-                        er["last_reply_at"] = now_str()
-                        er["status"] = f"ریپلای آنی روی پیام #{mid} ({step_ms}ms)"
-                        if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
-                            er["running"] = False
-                            er["status"] = "تکمیل شد"
-                            save_enemies()
-                            return
-                    except Exception as e:
-                        er["fail"] = int(er.get("fail") or 0) + 1
-                        er["last_error"] = str(e)[:70]
-            return
-        except Exception as e:
-            if is_kicked_error(e):
-                mark_account_kicked(acc_key, str(e)[:80])
-                return
-            if er.get("_fast_peer") is not None:
-                er["_fast_peer"] = None
-
-
-async def poll_enemy_rules():
-    active_rules = [er for er in list(enemy_rules) if er.get("running")]
-    if not active_rules:
-        return
-    await asyncio.gather(*[_poll_single_enemy(er) for er in active_rules], return_exceptions=True)
-
-
-async def enemy_fast_loop():
-    while True:
-        try:
-            await poll_enemy_rules()
-        except Exception:
-            pass
-        await asyncio.sleep(0.015)
-
-
 async def watcher_loop():
     tick = 0
     await ensure_accounts_connected()
-    asyncio.create_task(enemy_fast_loop())
 
     while True:
         await asyncio.sleep(0.5)
@@ -1402,10 +1200,9 @@ async def watcher_loop():
         if tick % 20 == 0:
             for a in list(accounts):
                 await check_acc_alive(a["key"])
-        if tick % 40 == 0:
+        if tick % 50 == 0:
             save_sessions()
             save_jobs()
-            save_enemies()
             if groups_by_acc:
                 save_groups_cache()
 
@@ -1554,9 +1351,7 @@ def api_del_account():
         groups_by_acc.pop(rkey, None)
         save_groups_cache()
         jobs[:] = [j for j in jobs if j.get("acc_key") != rkey]
-        enemy_rules[:] = [e for e in enemy_rules if e.get("acc_key") != rkey]
         save_jobs()
-        save_enemies()
     active_acc_key = accounts[0]["key"] if accounts else ""
     save_sessions()
     state["soroush_connected"] = is_acc_ready(active_acc_key) if active_acc_key else False
@@ -1613,109 +1408,6 @@ def api_fetch_msg():
     })
 
 
-@app.route("/api/identify_user")
-def api_identify_user():
-    link = (request.args.get("link") or "").strip()
-    chat_id = (request.args.get("chat_id") or "").strip()
-    acc_key = resolve_acc_key(request.args.get("acc_key") or "")
-    if not link:
-        return jsonify({"ok": False, "msg": "لینک پیام را وارد کنید."})
-    fut = run_async(identify_user_from_link(acc_key, link, chat_id))
-    if fut:
-        try:
-            return jsonify(fut.result(timeout=12))
-        except Exception as e:
-            return jsonify({"ok": False, "msg": str(e)})
-    return jsonify({"ok": False, "msg": "خطا در شناسایی کاربر."})
-
-
-@app.route("/api/add_enemy")
-def api_add_enemy():
-    global enemy_seq
-    acc_key = resolve_acc_key(request.args.get("acc_key") or "")
-    if not is_acc_ready(acc_key):
-        acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
-        if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
-            fut = run_async(connect_single_account(acc_obj))
-            if fut:
-                try:
-                    fut.result(timeout=8)
-                except Exception:
-                    pass
-    if not is_acc_ready(acc_key):
-        return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست."})
-
-    if total_running_count() >= MAX_TOTAL_ACTIVE:
-        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان (اسپم/فوروارد/دشمن) قابل اجراست."})
-
-    chat_id = clean_target(request.args.get("chat_id") or "")
-    user_id = (request.args.get("user_id") or "").strip()
-    user_name = (request.args.get("user_name") or user_id).strip()
-    reply_texts = parse_multi_texts(request.args.get("reply_texts") or request.args.get("reply_text") or "")
-    max_count = max(0, int(request.args.get("max_count") or 0))
-
-    if not chat_id or not user_id:
-        return jsonify({"ok": False, "msg": "ابتدا با لینک پیام، کاربر را در چت شناسایی کنید."})
-    if not reply_texts:
-        return jsonify({"ok": False, "msg": "حداقل یک متن ریپلای دشمن وارد کنید."})
-
-    enemy_seq += 1
-    er = {
-        "id": str(enemy_seq),
-        "acc_key": acc_key,
-        "acc_label": get_acc_label(acc_key),
-        "chat_id": chat_id,
-        "user_id": user_id,
-        "user_name": user_name,
-        "reply_texts": reply_texts,
-        "reply_text": reply_texts[0],
-        "reply_idx": 0,
-        "last_step_ms": 0,
-        "max_count": max_count,
-        "replied_count": 0,
-        "ok": 0,
-        "fail": 0,
-        "replied_msg_ids": [],
-        "last_seen_msg_id": 0,
-        "last_reply_at": "-",
-        "last_error": "",
-        "status": "آماده ریپلای آنی در همین چت",
-        "running": True,
-        "_fast_peer": None,
-    }
-    enemy_rules.append(er)
-    save_enemies()
-    emit_soroush_event(f"دشمن «{user_name}» در چت {chat_id} فعال شد")
-    return jsonify({
-        "ok": True,
-        "msg": f"دشمن «{user_name}» در چت {chat_id} فعال شد."
-    })
-
-
-@app.route("/api/enemy_ctrl")
-def api_enemy_ctrl():
-    eid = (request.args.get("id") or "").strip()
-    act = (request.args.get("act") or "").strip()
-    for er in list(enemy_rules):
-        if er["id"] == eid:
-            if act == "toggle":
-                if not er.get("running"):
-                    if not is_acc_ready(er.get("acc_key") or ""):
-                        return jsonify({"ok": False, "msg": "اکانت مربوط به این قانون متصل نیست."})
-                    if total_running_count() >= MAX_TOTAL_ACTIVE:
-                        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان قابل اجراست."})
-                er["running"] = not er.get("running", False)
-                er["last_seen_msg_id"] = 0
-                er["_fast_peer"] = None
-                er["status"] = "آماده ریپلای آنی در همین چت" if er["running"] else "متوقف"
-            elif act == "delete":
-                enemy_rules.remove(er)
-            break
-    save_enemies()
-    emit_soroush_event("وضعیت لیست دشمن‌ها بروز شد")
-    return jsonify({"ok": True})
-
-
 @app.route("/api/add_job")
 def api_add_job():
     global job_seq
@@ -1733,10 +1425,10 @@ def api_add_job():
         return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست؛ کمی صبر کن و دوباره بزن."})
 
     if total_running_count() >= MAX_TOTAL_ACTIVE:
-        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان (اسپم/فوروارد/دشمن) قابل اجراست."})
+        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان (اسپم/فوروارد/ریپلای) قابل اجراست."})
 
     mode = (request.args.get("mode") or "spam").strip().lower()
-    if mode not in ("spam", "forward"):
+    if mode not in ("spam", "forward", "reply"):
         mode = "spam"
 
     texts = parse_multi_texts(request.args.get("texts") or request.args.get("payload") or "")
@@ -1746,20 +1438,31 @@ def api_add_job():
 
     parsed_chat = ""
     parsed_msg_id = 0
-    if mode == "forward" and raw_link:
+    if raw_link:
         parsed_chat, parsed_msg_id, _ = parse_splus_link(raw_link)
-
-    targets = [clean_target(x) for x in re.split(r"[,\n]+", raw_targets) if clean_target(x)][:MAX_TARGETS_PER_JOB]
-    if not targets:
-        return jsonify({"ok": False, "msg": "مقصد معتبر وارد کنید."})
 
     msg_id = int(request.args.get("msg_id") or parsed_msg_id or 0)
     src_chat = clean_target(request.args.get("source_chat") or parsed_chat or "")
 
-    if mode == "forward":
+    if mode == "reply":
+        reply_target_raw = raw_targets or src_chat
+        targets = [clean_target(x) for x in re.split(r"[,\n]+", reply_target_raw) if clean_target(x)][:MAX_TARGETS_PER_JOB]
+        if not targets:
+            return jsonify({"ok": False, "msg": "چت مقصد ریپلای یافت نشد؛ لینک پیام را بررسی کنید."})
+        if msg_id <= 0:
+            return jsonify({"ok": False, "msg": "شناسه پیام برای ریپلای معتبر نیست."})
+        if not payload.strip():
+            return jsonify({"ok": False, "msg": "متن ریپلای را وارد یا تایید کنید."})
+    elif mode == "forward":
+        targets = [clean_target(x) for x in re.split(r"[,\n]+", raw_targets) if clean_target(x)][:MAX_TARGETS_PER_JOB]
+        if not targets:
+            return jsonify({"ok": False, "msg": "مقصد معتبر وارد کنید."})
         if not payload.strip() and msg_id <= 0:
             return jsonify({"ok": False, "msg": "ابتدا لینک پیام را خوانده و تأیید کنید."})
     else:
+        targets = [clean_target(x) for x in re.split(r"[,\n]+", raw_targets) if clean_target(x)][:MAX_TARGETS_PER_JOB]
+        if not targets:
+            return jsonify({"ok": False, "msg": "مقصد معتبر وارد کنید."})
         if not payload.strip():
             return jsonify({"ok": False, "msg": "متن پیام خالی است."})
 
@@ -1856,10 +1559,6 @@ def api_state():
         {k: v for k, v in j.items() if not str(k).startswith("_")}
         for j in jobs
     ]
-    enemies_clean = [
-        {k: v for k, v in er.items() if not str(k).startswith("_")}
-        for er in enemy_rules
-    ]
 
     return jsonify({
         "ping": state["ping"],
@@ -1875,7 +1574,6 @@ def api_state():
         "accounts": acc_list_out,
         "groups": cur_groups,
         "jobs": jobs_clean,
-        "enemy_rules": enemies_clean,
     })
 
 
@@ -1883,8 +1581,6 @@ accounts[:] = load_sessions()
 groups_by_acc.update(load_groups_cache())
 loaded_jobs = load_jobs()
 jobs[:] = loaded_jobs if isinstance(loaded_jobs, list) else []
-loaded_enemies = load_enemies()
-enemy_rules[:] = loaded_enemies if isinstance(loaded_enemies, list) else []
 
 Thread(target=start_bot_thread, daemon=True).start()
 
