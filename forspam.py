@@ -52,7 +52,7 @@ JOBS_FILE = _state_path("fonex_jobs.json")
 ENEMIES_FILE = _state_path("fonex_enemies.json")
 GROUPS_CACHE_FILE = _state_path("fonex_groups_cache.json")
 
-MAX_ACTIVE_JOBS = 5
+MAX_TOTAL_ACTIVE = 3
 MAX_TARGETS_PER_JOB = 3
 
 KICK_KEYWORDS = (
@@ -114,6 +114,12 @@ def emit_soroush_event(notice_text=""):
     if notice_text:
         state["event_notice"] = notice_text
     return event_seq
+
+
+def total_running_count():
+    active_jobs = sum(1 for j in jobs if j.get("running"))
+    active_enemies = sum(1 for e in enemy_rules if e.get("running"))
+    return active_jobs + active_enemies
 
 
 def norm_acc_key(val):
@@ -293,9 +299,9 @@ def load_jobs():
             j.setdefault("text_idx", 0)
             j.setdefault("t_idx", 0)
             j.setdefault("sent_burst", 0)
-            j.setdefault("speed_ms", 500)
+            j.setdefault("speed_ms", 400)
             j.setdefault("last_step_ms", 0)
-            j.setdefault("effective_delay_ms", int(j.get("speed_ms") or 500))
+            j.setdefault("effective_delay_ms", int(j.get("speed_ms") or 400))
             j.setdefault("heal_state", "running" if j.get("running") else "paused")
             j.setdefault("last_error", "")
             j.setdefault("ok", 0)
@@ -327,10 +333,11 @@ def load_enemies():
                 er["reply_texts"] = r_texts
                 er["reply_text"] = r_texts[0] if r_texts else str(er.get("reply_text") or "")
                 er.setdefault("reply_idx", 0)
-                er.setdefault("speed_ms", 40)
                 er.setdefault("last_step_ms", 0)
                 er.setdefault("replied_msg_ids", [])
                 er.setdefault("last_seen_msg_id", 0)
+                er.setdefault("ok", int(er.get("replied_count") or 0))
+                er.setdefault("fail", 0)
                 cleaned.append(er)
     enemy_seq = max(max_num, len(cleaned))
     return cleaned
@@ -1106,7 +1113,7 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
     for peer in peers:
         for kw_name in ("reply_to", "reply_to_msg_id"):
             try:
-                await maybe_await(c.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=6)
+                await maybe_await(c.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=5)
                 return None
             except TypeError as te:
                 last_err = te
@@ -1117,7 +1124,7 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
                     raise
                 break
         try:
-            await maybe_await(c.send_message(peer, text_payload), timeout=6)
+            await maybe_await(c.send_message(peer, text_payload), timeout=5)
             return None
         except Exception as e2:
             last_err = e2
@@ -1242,7 +1249,7 @@ async def run_job_worker(job):
         idx = int(job.get("t_idx") or 0) % len(targets)
         current_target = targets[idx]
         chosen_text = pick_next_job_text(job)
-        configured_delay_ms = max(40, int(job.get("speed_ms") or 500))
+        configured_delay_ms = max(40, int(job.get("speed_ms") or 400))
         job["speed_ms"] = configured_delay_ms
 
         t_start = time.perf_counter()
@@ -1271,14 +1278,6 @@ async def run_job_worker(job):
             job["last_error"] = err_txt[:90]
             job["t_idx"] = (idx + 1) % len(targets)
             add_log(job, f"ERR ({step_ms}ms) -> {err_txt[:75]}")
-
-        rest_every = int(job.get("rest_every") or 0)
-        rest_ms = int(job.get("rest_ms") or 0)
-        if rest_every > 0 and rest_ms > 0 and int(job.get("sent_burst") or 0) >= rest_every:
-            job["sent_burst"] = 0
-            job["effective_delay_ms"] = max(configured_delay_ms, rest_ms)
-            await asyncio.sleep(rest_ms / 1000.0)
-            continue
 
         await asyncio.sleep(configured_delay_ms / 1000.0)
 
@@ -1310,7 +1309,7 @@ async def _poll_single_enemy(er):
     for p in peers:
         try:
             t0 = time.perf_counter()
-            msgs = await maybe_await(c.get_messages(p, limit=8), timeout=3.5)
+            msgs = await maybe_await(c.get_messages(p, limit=6), timeout=3)
             if not isinstance(msgs, (list, tuple)):
                 continue
             ordered = sorted(
@@ -1338,22 +1337,26 @@ async def _poll_single_enemy(er):
                     enemy_name and enemy_name in f"{uid} {uname}".lower()
                 )
                 if u_match:
-                    next_reply = pick_next_enemy_text(er)
-                    await send_reply_message(c, [p], next_reply, mid)
-                    step_ms = int((time.perf_counter() - t0) * 1000)
-                    seen_ids.add(mid)
-                    er["replied_msg_ids"] = list(seen_ids)[-160:]
-                    er["replied_count"] = int(er.get("replied_count") or 0) + 1
-                    er["last_step_ms"] = step_ms
-                    er["last_reply_at"] = now_str()
-                    er["status"] = f"ریپلای سریع روی پیام #{mid} ({step_ms}ms)"
-                    if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
-                        er["running"] = False
-                        er["status"] = "تکمیل شد"
-                    save_enemies()
-                    emit_soroush_event(f"ریپلای سریع روی پیام #{mid} ارسال شد")
-                    if not er.get("running"):
-                        break
+                    try:
+                        next_reply = pick_next_enemy_text(er)
+                        await send_reply_message(c, [p], next_reply, mid)
+                        step_ms = int((time.perf_counter() - t0) * 1000)
+                        seen_ids.add(mid)
+                        er["replied_msg_ids"] = list(seen_ids)[-160:]
+                        er["replied_count"] = int(er.get("replied_count") or 0) + 1
+                        er["ok"] = er["replied_count"]
+                        er["last_step_ms"] = step_ms
+                        er["last_reply_at"] = now_str()
+                        er["status"] = f"ریپلای آنی روی پیام #{mid} ({step_ms}ms)"
+                        if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
+                            er["running"] = False
+                            er["status"] = "تکمیل شد"
+                        save_enemies()
+                        if not er.get("running"):
+                            break
+                    except Exception as e:
+                        er["fail"] = int(er.get("fail") or 0) + 1
+                        er["last_error"] = str(e)[:70]
             break
         except Exception as e:
             if is_kicked_error(e):
@@ -1374,7 +1377,7 @@ async def enemy_fast_loop():
             await poll_enemy_rules()
         except Exception:
             pass
-        await asyncio.sleep(0.18)
+        await asyncio.sleep(0.06)
 
 
 async def watcher_loop():
@@ -1633,12 +1636,14 @@ def api_add_enemy():
     if not is_acc_ready(acc_key):
         return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست."})
 
+    if total_running_count() >= MAX_TOTAL_ACTIVE:
+        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان (اسپم/فوروارد/دشمن) قابل اجراست."})
+
     chat_id = clean_target(request.args.get("chat_id") or "")
     user_id = (request.args.get("user_id") or "").strip()
     user_name = (request.args.get("user_name") or user_id).strip()
     reply_texts = parse_multi_texts(request.args.get("reply_texts") or request.args.get("reply_text") or "")
     max_count = max(0, int(request.args.get("max_count") or 0))
-    speed_ms = max(20, int(request.args.get("speed_ms") or 40))
 
     if not chat_id or not user_id:
         return jsonify({"ok": False, "msg": "ابتدا با لینک پیام، کاربر را در چت شناسایی کنید."})
@@ -1656,10 +1661,11 @@ def api_add_enemy():
         "reply_texts": reply_texts,
         "reply_text": reply_texts[0],
         "reply_idx": 0,
-        "speed_ms": speed_ms,
         "last_step_ms": 0,
         "max_count": max_count,
         "replied_count": 0,
+        "ok": 0,
+        "fail": 0,
         "replied_msg_ids": [],
         "last_seen_msg_id": 0,
         "last_reply_at": "-",
@@ -1672,7 +1678,7 @@ def api_add_enemy():
     emit_soroush_event(f"دشمن «{user_name}» در چت {chat_id} فعال شد")
     return jsonify({
         "ok": True,
-        "msg": f"دشمن «{user_name}» فقط در چت {chat_id} با {len(reply_texts)} متن فعال شد."
+        "msg": f"دشمن «{user_name}» در چت {chat_id} فعال شد."
     })
 
 
@@ -1683,8 +1689,11 @@ def api_enemy_ctrl():
     for er in list(enemy_rules):
         if er["id"] == eid:
             if act == "toggle":
-                if not er.get("running") and not is_acc_ready(er.get("acc_key") or ""):
-                    return jsonify({"ok": False, "msg": "اکانت مربوط به این قانون متصل نیست."})
+                if not er.get("running"):
+                    if not is_acc_ready(er.get("acc_key") or ""):
+                        return jsonify({"ok": False, "msg": "اکانت مربوط به این قانون متصل نیست."})
+                    if total_running_count() >= MAX_TOTAL_ACTIVE:
+                        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان قابل اجراست."})
                 er["running"] = not er.get("running", False)
                 er["last_seen_msg_id"] = 0
                 er["status"] = "آماده ریپلای سریع در همین چت" if er["running"] else "متوقف"
@@ -1711,6 +1720,9 @@ def api_add_job():
                     pass
     if not is_acc_ready(acc_key):
         return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست؛ کمی صبر کن و دوباره بزن."})
+
+    if total_running_count() >= MAX_TOTAL_ACTIVE:
+        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان (اسپم/فوروارد/دشمن) قابل اجراست."})
 
     mode = (request.args.get("mode") or "spam").strip().lower()
     if mode not in ("spam", "forward"):
@@ -1740,13 +1752,9 @@ def api_add_job():
         if not payload.strip():
             return jsonify({"ok": False, "msg": "متن پیام خالی است."})
 
-    active_count = sum(1 for j in jobs if j.get("running"))
-    if active_count >= MAX_ACTIVE_JOBS:
-        return jsonify({"ok": False, "msg": f"فقط {MAX_ACTIVE_JOBS} تسک هم‌زمان قابل اجراست."})
-
     job_seq += 1
     acc_label = get_acc_label(acc_key)
-    speed_ms = max(40, int(request.args.get("speed_ms") or 500))
+    speed_ms = max(40, int(request.args.get("speed_ms") or 400))
     job = {
         "id": str(job_seq),
         "acc_key": acc_key,
@@ -1765,8 +1773,6 @@ def api_add_job():
         "last_step_ms": 0,
         "effective_delay_ms": speed_ms,
         "max_count": max(0, int(request.args.get("max_count") or 0)),
-        "rest_every": max(0, int(request.args.get("rest_every") or 0)),
-        "rest_ms": max(0, int(request.args.get("rest_ms") or 0)),
         "running": True,
         "heal_state": "running",
         "last_error": "",
@@ -1791,9 +1797,8 @@ def api_job_ctrl():
                     j_acc = j.get("acc_key") or resolve_acc_key("")
                     if not is_acc_ready(j_acc):
                         return jsonify({"ok": False, "msg": "اکانت این تسک متصل نیست."})
-                    active_count = sum(1 for x in jobs if x.get("running"))
-                    if active_count >= MAX_ACTIVE_JOBS:
-                        return jsonify({"ok": False, "msg": f"فقط {MAX_ACTIVE_JOBS} تسک هم‌زمان قابل اجراست."})
+                    if total_running_count() >= MAX_TOTAL_ACTIVE:
+                        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان قابل اجراست."})
                 j["running"] = not j.get("running", False)
                 j["heal_state"] = "running" if j["running"] else "paused"
             elif act == "delete":
