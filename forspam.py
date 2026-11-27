@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import traceback
 from datetime import datetime
 from threading import Thread
 from urllib.parse import urlparse
@@ -22,14 +23,41 @@ except Exception:
     psutil = None
 
 PORT = int(os.environ.get("PORT", 8080))
-SESSIONS_FILE = "soroush_sessions.json"
-JOBS_FILE = "fonex_jobs.json"
-ENEMIES_FILE = "fonex_enemies.json"
-GROUPS_CACHE_FILE = "fonex_groups_cache.json"
+
+
+def _resolve_state_dir():
+    preferred = (os.environ.get("FONEX_STATE_DIR") or "").strip()
+    candidates = [d for d in (preferred, "/tmp/fonex_state", ".") if d]
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            test_path = os.path.join(d, ".write_test")
+            with open(test_path, "w", encoding="utf-8") as tf:
+                tf.write("ok")
+            os.remove(test_path)
+            return d
+        except Exception:
+            continue
+    return "."
+
+
+STATE_DIR = _resolve_state_dir()
+
+
+def _state_path(filename):
+    return os.path.join(STATE_DIR, filename)
+
+
+SESSIONS_FILE = _state_path("soroush_sessions.json")
+JOBS_FILE = _state_path("fonex_jobs.json")
+ENEMIES_FILE = _state_path("fonex_enemies.json")
+GROUPS_CACHE_FILE = _state_path("fonex_groups_cache.json")
+RECOVERY_FILE = _state_path("fonex_recovery.json")
+ERRORS_LOG_FILE = _state_path("fonex_errors.log")
+
 MAX_ACTIVE_JOBS = 5
 MAX_TARGETS_PER_JOB = 3
 
-# فقط خطاهای واقعی نشست/سشن، نه خطاهای معمولی شبکه یا سرور
 KICK_KEYWORDS = (
     "session_revoked",
     "auth_key_unregistered",
@@ -50,8 +78,9 @@ jobs = []
 enemy_rules = []
 clients_by_acc = {}
 pending_auth_by_acc = {}
+recent_errors = []
 
-job_seq = 0
+job_seq = 100
 enemy_seq = 0
 event_seq = 1
 last_panel_visit_ts = 0.0
@@ -70,7 +99,6 @@ state = {
 }
 
 bot_loop = None
-op_lock = asyncio.Lock()
 
 
 @app.after_request
@@ -83,6 +111,25 @@ def add_cors(resp):
 
 def now_str():
     return datetime.now().strftime("%H:%M:%S")
+
+
+def record_error(source, err, auto_fix=""):
+    err_str = str(err or "").strip()
+    if not err_str:
+        return
+    entry = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "error": err_str[:220],
+        "auto_fix": auto_fix[:160],
+    }
+    recent_errors.append(entry)
+    recent_errors[:] = recent_errors[-40:]
+    try:
+        with open(ERRORS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{entry['time']}] [{source}] {entry['error']} | fix={entry['auto_fix']}\n")
+    except Exception:
+        pass
 
 
 def emit_soroush_event(notice_text=""):
@@ -154,153 +201,196 @@ def parse_multi_texts(raw_val):
     return parts if parts else [s]
 
 
-def save_sessions():
+def _atomic_write_json(filepath, data):
+    tmp = filepath + ".tmp"
+    bak = filepath + ".bak"
     try:
-        payload = {
-            "active_acc_key": active_acc_key,
-            "accounts": [
-                {
-                    "key": a.get("key", ""),
-                    "phone": a.get("phone", ""),
-                    "name": a.get("name", ""),
-                    "session": a.get("session", ""),
-                }
-                for a in accounts
-                if a.get("session")
-            ],
-        }
-        with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as src, open(bak, "w", encoding="utf-8") as dst:
+                    dst.write(src.read())
+            except Exception:
+                pass
+        os.replace(tmp, filepath)
+    except Exception as e:
+        record_error("write_json", e, "fallback_direct_write")
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+def _read_json_with_fallback(filepath, default_val):
+    for cand in (filepath, filepath + ".bak"):
+        if os.path.exists(cand):
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    parsed = json.load(f)
+                    if parsed is not None:
+                        return parsed
+            except Exception:
+                continue
+    return default_val
+
+
+def save_recovery_snapshot():
+    active_jobs_ids = [j.get("id") for j in jobs if j.get("running")]
+    active_enemies_ids = [er.get("id") for er in enemy_rules if er.get("running")]
+    snap = {
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "active_acc_key": active_acc_key,
+        "phone": state.get("phone", ""),
+        "active_job_ids": active_jobs_ids,
+        "active_enemy_ids": active_enemies_ids,
+        "recent_errors": recent_errors[-20:],
+    }
+    _atomic_write_json(RECOVERY_FILE, snap)
+
+
+def save_sessions():
+    payload = {
+        "active_acc_key": active_acc_key,
+        "accounts": [
+            {
+                "key": a.get("key", ""),
+                "phone": a.get("phone", ""),
+                "name": a.get("name", ""),
+                "session": a.get("session", ""),
+            }
+            for a in accounts
+            if a.get("session")
+        ],
+    }
+    _atomic_write_json(SESSIONS_FILE, payload)
+    save_recovery_snapshot()
 
 
 def load_sessions():
     global active_acc_key
     loaded = []
-    if os.path.exists(SESSIONS_FILE):
-        try:
-            with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    active_acc_key = norm_acc_key(data.get("active_acc_key") or "")
-                    for item in data.get("accounts") or []:
-                        if not isinstance(item, dict):
-                            continue
-                        sess = str(item.get("session") or "").strip()
-                        phone = str(item.get("phone") or "").strip()
-                        key = norm_acc_key(item.get("key") or phone)
-                        if key and sess:
-                            loaded.append({
-                                "key": key,
-                                "phone": phone or key,
-                                "name": str(item.get("name") or phone or key),
-                                "session": sess,
-                                "connected": False,
-                                "kicked": False,
-                            })
-        except Exception:
-            loaded = []
-    if not active_acc_key and loaded:
+    data = _read_json_with_fallback(SESSIONS_FILE, {})
+    rec = _read_json_with_fallback(RECOVERY_FILE, {})
+    if isinstance(data, dict):
+        active_acc_key = norm_acc_key(data.get("active_acc_key") or "")
+        for item in data.get("accounts") or []:
+            if not isinstance(item, dict):
+                continue
+            sess = str(item.get("session") or "").strip()
+            phone = str(item.get("phone") or "").strip()
+            key = norm_acc_key(item.get("key") or phone)
+            if key and sess:
+                loaded.append({
+                    "key": key,
+                    "phone": phone or key,
+                    "name": str(item.get("name") or phone or key),
+                    "session": sess,
+                    "connected": False,
+                    "kicked": False,
+                })
+    if not active_acc_key and isinstance(rec, dict):
+        active_acc_key = norm_acc_key(rec.get("active_acc_key") or "")
+
+    env_sess = (os.environ.get("SOROUSH_SESSION") or "").strip()
+    env_phone = (os.environ.get("SOROUSH_PHONE") or "env_account").strip()
+    if env_sess and not loaded:
+        ekey = norm_acc_key(env_phone) or "env_acc"
+        loaded.append({
+            "key": ekey,
+            "phone": env_phone,
+            "name": env_phone,
+            "session": env_sess,
+            "connected": False,
+            "kicked": False,
+        })
+    if loaded and (not active_acc_key or not any(a["key"] == active_acc_key for a in loaded)):
         active_acc_key = loaded[0]["key"]
     return loaded
 
 
 def save_jobs():
-    try:
-        with open(JOBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(jobs, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _atomic_write_json(JOBS_FILE, jobs)
+    save_recovery_snapshot()
 
 
 def load_jobs():
     global job_seq
     cleaned = []
+    max_num = 100
     default_key = resolve_acc_key("")
-    if os.path.exists(JOBS_FILE):
-        try:
-            with open(JOBS_FILE, "r", encoding="utf-8") as f:
-                arr = json.load(f)
-                if isinstance(arr, list):
-                    for j in arr:
-                        if not isinstance(j, dict):
-                            continue
-                        mode = j.get("mode") if j.get("mode") in ("spam", "forward", "reply_chain") else "spam"
-                        j["mode"] = mode
-                        j["acc_key"] = norm_acc_key(j.get("acc_key") or "") or default_key
-                        j["targets"] = (j.get("targets") or [])[:MAX_TARGETS_PER_JOB]
-                        texts = parse_multi_texts(j.get("texts") or j.get("payload") or "")
-                        j["texts"] = texts
-                        j["payload"] = texts[0] if texts else str(j.get("payload") or "")
-                        j.setdefault("text_idx", 0)
-                        j.setdefault("reply_to_msg_id", 0)
-                        j.setdefault("t_idx", 0)
-                        j.setdefault("sent_burst", 0)
-                        j.setdefault("speed_ms", 500)
-                        j.setdefault("last_step_ms", 0)
-                        j.setdefault("effective_delay_ms", int(j.get("speed_ms") or 500))
-                        j.setdefault("heal_state", "normal")
-                        j.setdefault("last_error", "")
-                        j.setdefault("ok", 0)
-                        j.setdefault("fail", 0)
-                        j.setdefault("logs", [])
-                        cleaned.append(j)
-        except Exception:
-            cleaned = []
-    job_seq = len(cleaned)
+    arr = _read_json_with_fallback(JOBS_FILE, [])
+    if isinstance(arr, list):
+        for j in arr:
+            if not isinstance(j, dict):
+                continue
+            jid_str = str(j.get("id") or "").strip()
+            if jid_str.isdigit() and int(jid_str) > max_num:
+                max_num = int(jid_str)
+            mode = j.get("mode") if j.get("mode") in ("spam", "forward", "reply_chain") else "spam"
+            j["mode"] = mode
+            j["acc_key"] = norm_acc_key(j.get("acc_key") or "") or default_key
+            j["targets"] = (j.get("targets") or [])[:MAX_TARGETS_PER_JOB]
+            texts = parse_multi_texts(j.get("texts") or j.get("payload") or "")
+            j["texts"] = texts
+            j["payload"] = texts[0] if texts else str(j.get("payload") or "")
+            j.setdefault("text_idx", 0)
+            j.setdefault("reply_to_msg_id", 0)
+            j.setdefault("t_idx", 0)
+            j.setdefault("sent_burst", 0)
+            j.setdefault("speed_ms", 500)
+            j.setdefault("last_step_ms", 0)
+            j.setdefault("effective_delay_ms", int(j.get("speed_ms") or 500))
+            j.setdefault("heal_state", "recovered" if j.get("running") else "paused")
+            j.setdefault("last_error", "")
+            j.setdefault("ok", 0)
+            j.setdefault("fail", 0)
+            j.setdefault("logs", [])
+            if j.get("running"):
+                add_log(j, "RECOVERY -> بازیابی خودکار تسک پس از ری‌استارت")
+            cleaned.append(j)
+    job_seq = max(max_num, 100 + len(cleaned))
     return cleaned
 
 
 def save_enemies():
-    try:
-        with open(ENEMIES_FILE, "w", encoding="utf-8") as f:
-            json.dump(enemy_rules, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _atomic_write_json(ENEMIES_FILE, enemy_rules)
+    save_recovery_snapshot()
 
 
 def load_enemies():
     global enemy_seq
     cleaned = []
-    if os.path.exists(ENEMIES_FILE):
-        try:
-            with open(ENEMIES_FILE, "r", encoding="utf-8") as f:
-                arr = json.load(f)
-                if isinstance(arr, list):
-                    for er in arr:
-                        if isinstance(er, dict):
-                            r_texts = parse_multi_texts(er.get("reply_texts") or er.get("reply_text") or "")
-                            er["reply_texts"] = r_texts
-                            er["reply_text"] = r_texts[0] if r_texts else str(er.get("reply_text") or "")
-                            er.setdefault("reply_idx", 0)
-                            er.setdefault("speed_ms", 350)
-                            er.setdefault("last_step_ms", 0)
-                            cleaned.append(er)
-        except Exception:
-            cleaned = []
-    enemy_seq = len(cleaned)
+    max_num = 0
+    arr = _read_json_with_fallback(ENEMIES_FILE, [])
+    if isinstance(arr, list):
+        for er in arr:
+            if isinstance(er, dict):
+                eid_str = str(er.get("id") or "").strip()
+                if eid_str.isdigit() and int(eid_str) > max_num:
+                    max_num = int(eid_str)
+                r_texts = parse_multi_texts(er.get("reply_texts") or er.get("reply_text") or "")
+                er["reply_texts"] = r_texts
+                er["reply_text"] = r_texts[0] if r_texts else str(er.get("reply_text") or "")
+                er.setdefault("reply_idx", 0)
+                er.setdefault("speed_ms", 350)
+                er.setdefault("last_step_ms", 0)
+                er.setdefault("replied_msg_ids", [])
+                if er.get("running"):
+                    er["status"] = "بازیابی شد و آماده ریپلای"
+                cleaned.append(er)
+    enemy_seq = max(max_num, len(cleaned))
     return cleaned
 
 
 def save_groups_cache():
-    try:
-        with open(GROUPS_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(groups_by_acc, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _atomic_write_json(GROUPS_CACHE_FILE, groups_by_acc)
 
 
 def load_groups_cache():
-    if os.path.exists(GROUPS_CACHE_FILE):
-        try:
-            with open(GROUPS_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception:
-            pass
-    return {}
+    data = _read_json_with_fallback(GROUPS_CACHE_FILE, {})
+    return data if isinstance(data, dict) else {}
 
 
 def normalize_numeric_id(raw_num):
@@ -474,6 +564,7 @@ def is_kicked_error(err):
 
 
 def mark_account_kicked(acc_key, reason="اکانت از سشن خارج شد."):
+    record_error("account_kicked", f"{acc_key}: {reason}", "stop_jobs_and_clear_session")
     for a in accounts:
         if a.get("key") == acc_key:
             a["connected"] = False
@@ -565,28 +656,60 @@ async def refresh_groups(acc_key="", force_alive=True):
     _refreshing_keys.add(target_key)
     try:
         if force_alive:
-            if not await check_acc_alive(target_key):
-                return groups_by_acc.get(target_key, [])
+            alive = await check_acc_alive(target_key)
+            if not alive:
+                acc_obj = next((a for a in accounts if a.get("key") == target_key), None)
+                if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+                    await connect_single_account(acc_obj)
+
         c = get_acc_client(target_key)
-        if not c or not hasattr(c, "get_dialogs"):
+        if not c:
             return groups_by_acc.get(target_key, [])
-        dialogs = await maybe_await(c.get_dialogs(limit=100), timeout=8)
+
+        dialogs = None
+        for attempt in range(2):
+            try:
+                if hasattr(c, "get_dialogs"):
+                    dialogs = await maybe_await(c.get_dialogs(limit=120), timeout=9)
+                elif hasattr(c, "iter_dialogs"):
+                    tmp = []
+                    async for d in c.iter_dialogs(limit=120):
+                        tmp.append(d)
+                    dialogs = tmp
+                if dialogs is not None:
+                    break
+            except Exception as e:
+                if is_kicked_error(e):
+                    mark_account_kicked(target_key, str(e)[:80])
+                    return groups_by_acc.get(target_key, [])
+                record_error("refresh_groups", e, "reconnect_and_retry_dialogs")
+                if attempt == 0:
+                    acc_obj = next((a for a in accounts if a.get("key") == target_key), None)
+                    if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+                        await connect_single_account(acc_obj)
+                        c = get_acc_client(target_key)
+
         items = []
         seen = set()
         for d in list(dialogs or []):
-            did = str(getattr(d, "id", "") or "")
+            entity = getattr(d, "entity", None) or d
+            did = str(getattr(d, "id", None) or getattr(entity, "id", None) or "").strip()
             if not did or did in seen:
                 continue
             seen.add(did)
-            name = getattr(d, "name", None) or getattr(d, "title", None) or did
+            name = (
+                getattr(d, "name", None)
+                or getattr(d, "title", None)
+                or getattr(entity, "title", None)
+                or getattr(entity, "first_name", None)
+                or did
+            )
             items.append({"id": did, "name": str(name)})
+
         if items:
             groups_by_acc[target_key] = items
             save_groups_cache()
             emit_soroush_event(f"لیست چت‌ها ({len(items)}) دریافت شد")
-    except Exception as e:
-        if is_kicked_error(e):
-            mark_account_kicked(target_key, str(e)[:80])
     finally:
         _refreshing_keys.discard(target_key)
     return groups_by_acc.get(target_key, [])
@@ -595,6 +718,7 @@ async def refresh_groups(acc_key="", force_alive=True):
 async def connect_single_account(acc_obj, force_new=False):
     acc_key = acc_obj["key"]
     if not SoroushClient or not StringSession:
+        record_error("connect_single_account", "splusthon not installed", "check_requirements")
         return False
     sess = (acc_obj.get("session") or "").strip()
     if not sess and not force_new:
@@ -623,18 +747,22 @@ async def connect_single_account(acc_obj, force_new=False):
             acc_obj["kicked"] = False
             clients_by_acc[acc_key] = {"client": c, "ready": True if sess else False}
             if acc_key == active_acc_key:
+                state["phone"] = acc_obj.get("phone", state.get("phone", ""))
                 state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
                 state["kicked_out"] = False
                 state["soroush_connected"] = bool(sess)
-                state["healer_status"] = "متصل به سروش (قوی)" if sess else "در انتظار ورود"
+                state["healer_status"] = "متصل به سروش (بازیابی‌شده)" if sess else "در انتظار ورود"
             if sess:
-                emit_soroush_event(f"سروش به پنل متصل شد ({acc_obj.get('name') or acc_key})")
-                asyncio.create_task(refresh_groups(acc_key, force_alive=False))
+                save_sessions()
+                emit_soroush_event(f"اتصال اکانت {acc_obj.get('name') or acc_key} برقرار شد")
+                if not groups_by_acc.get(acc_key):
+                    asyncio.create_task(refresh_groups(acc_key, force_alive=False))
             return True
         except Exception as e:
             if is_kicked_error(e):
                 mark_account_kicked(acc_key, str(e)[:80])
                 return False
+            record_error(f"connect:{acc_key}", e, f"retry_attempt_{attempt+1}")
             if attempt == 0:
                 await asyncio.sleep(0.6)
                 continue
@@ -644,13 +772,21 @@ async def connect_single_account(acc_obj, force_new=False):
 
 async def ensure_accounts_connected():
     connected_any = False
+    ordered = []
+    act = get_active_account()
+    if act:
+        ordered.append(act)
     for a in list(accounts):
+        if a not in ordered:
+            ordered.append(a)
+
+    for a in ordered:
         if a.get("session") and not a.get("kicked") and not is_acc_ready(a["key"]):
             ok = await connect_single_account(a)
             if ok:
                 connected_any = True
     if connected_any:
-        emit_soroush_event("اتصال سروش برقرار شد و اطلاعات بروز شد")
+        emit_soroush_event("اکانت و تسک‌ها پس از اتصال بازیابی شدند")
 
 
 async def check_acc_alive(acc_key):
@@ -675,13 +811,13 @@ async def check_acc_alive(acc_key):
             if acc_key == active_acc_key:
                 state["kicked_out"] = False
                 state["soroush_connected"] = True
-                state["healer_status"] = "متصل به سروش (قوی)"
+                state["healer_status"] = "متصل به سروش (پایدار)"
         return True
     except Exception as e:
         if is_kicked_error(e):
             mark_account_kicked(acc_key, str(e)[:80])
             return False
-        # در صورت خطای موقت شبکه، سریع دوباره وصل شو و اکانت را از کار نینداز
+        record_error(f"alive:{acc_key}", e, "background_reconnect")
         acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
         if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
             asyncio.create_task(connect_single_account(acc_obj))
@@ -712,6 +848,7 @@ async def do_send_code(phone):
                 a["phone"] = phone or a.get("phone") or acc_key
                 a["kicked"] = False
 
+    save_recovery_snapshot()
     emit_soroush_event(f"شماره {phone} ثبت شد")
 
     if not SoroushClient or not StringSession:
@@ -763,6 +900,7 @@ async def do_send_code(phone):
             return
         except Exception as e:
             last_err = e
+            record_error("send_code", e, f"retry_{attempt+1}")
             if attempt < 2:
                 await asyncio.sleep(0.8)
                 continue
@@ -850,7 +988,7 @@ async def do_verify_code(code):
         save_sessions()
         state["kicked_out"] = False
         state["soroush_connected"] = True
-        state["healer_status"] = "متصل به سروش (قوی)"
+        state["healer_status"] = "متصل به سروش (پایدار)"
         state["auth_msg"] = f"اکانت {name} متصل شد."
         emit_soroush_event(f"اکانت {name} به سروش وصل شد")
         try:
@@ -858,6 +996,7 @@ async def do_verify_code(code):
         except Exception:
             pass
     except Exception as e:
+        record_error("verify_code", e, "keep_pending_auth")
         state["auth_msg"] = f"خطا در تأیید کد: {e}"
 
 
@@ -871,7 +1010,7 @@ async def find_channel_in_dialogs(acc_key, raw_chat):
 
     if is_acc_ready(acc_key) and c is not None and hasattr(c, "get_dialogs"):
         try:
-            dlgs = await maybe_await(c.get_dialogs(limit=100), timeout=8)
+            dlgs = await maybe_await(c.get_dialogs(limit=120), timeout=8)
             for d in list(dlgs or []):
                 entity = getattr(d, "entity", None) or d
                 did_str = str(getattr(d, "id", None) or getattr(entity, "id", None) or "").strip()
@@ -926,7 +1065,7 @@ async def fetch_single_message(acc_key, raw_chat, msg_id):
 
     for peer in peer_cands:
         try:
-            hist = await maybe_await(c.get_messages(peer, limit=50), timeout=7)
+            hist = await maybe_await(c.get_messages(peer, limit=60), timeout=7)
             if isinstance(hist, (list, tuple)):
                 for item in hist:
                     if get_msg_id_val(item) == int(msg_id):
@@ -1036,9 +1175,18 @@ async def execute_job_step(job, raw_target, pre_text=None):
             raise ValueError("شناسه پیام ریپلای مشخص نیست.")
         if not payload.strip():
             raise ValueError("متن ریپلای خالی است.")
-        await send_reply_message(c, dst_cands, payload, reply_msg_id)
-        add_log(job, f"REPLY #{reply_msg_id} OK -> {clean_target(raw_target)}")
-        return
+        last_e = None
+        for _ in range(2):
+            try:
+                await send_reply_message(c, dst_cands, payload, reply_msg_id)
+                add_log(job, f"REPLY #{reply_msg_id} OK -> {clean_target(raw_target)}")
+                return
+            except Exception as e:
+                last_e = e
+                if is_kicked_error(e):
+                    raise
+                await asyncio.sleep(0.2)
+        raise last_e if last_e else RuntimeError("ریپلای ارسال نشد.")
 
     if mode == "forward":
         src_cands = peer_candidates(job.get("source_chat")) if job.get("source_chat") else []
@@ -1053,23 +1201,29 @@ async def execute_job_step(job, raw_target, pre_text=None):
                     continue
                 for dst_p in dst_cands:
                     for src_p in src_cands:
-                        try:
-                            await maybe_await(fn(dst_p, msg_id, from_peer=src_p), timeout=8)
-                            sent_ok = True
-                            add_log(job, f"FWD OK -> {clean_target(raw_target)} (#{msg_id})")
+                        for call_fn in (
+                            lambda: fn(dst_p, msg_id, from_peer=src_p),
+                            lambda: fn(dst_p, [msg_id], from_peer=src_p),
+                        ):
+                            try:
+                                await maybe_await(call_fn(), timeout=8)
+                                sent_ok = True
+                                add_log(job, f"FWD OK -> {clean_target(raw_target)} (#{msg_id})")
+                                break
+                            except TypeError:
+                                continue
+                            except Exception as e:
+                                last_err = e
+                                if is_kicked_error(e):
+                                    raise
+                        if sent_ok:
                             break
-                        except Exception as e:
-                            last_err = e
-                            if is_kicked_error(e):
-                                raise
                     if sent_ok:
                         break
                 if sent_ok:
                     break
 
-        if not sent_ok:
-            if not payload.strip():
-                raise RuntimeError("متن پیام خالی است.")
+        if not sent_ok and payload.strip():
             for dst_p in dst_cands:
                 try:
                     await maybe_await(c.send_message(dst_p, payload), timeout=8)
@@ -1111,8 +1265,8 @@ async def run_job_worker(job):
                 await connect_single_account(acc_obj)
             if not is_acc_ready(acc_key):
                 job["heal_state"] = "reconnecting"
-                job["last_error"] = "در حال حفظ اتصال با سروش..."
-                await asyncio.sleep(1.0)
+                job["last_error"] = "در حال بازیابی اتصال اکانت..."
+                await asyncio.sleep(0.8)
                 continue
 
         max_c = int(job.get("max_count") or 0)
@@ -1136,30 +1290,32 @@ async def run_job_worker(job):
         job["speed_ms"] = configured_delay_ms
 
         t_start = time.perf_counter()
-        async with op_lock:
-            try:
-                await execute_job_step(job, current_target, pre_text=chosen_text)
-                step_ms = int((time.perf_counter() - t_start) * 1000)
-                job["ok"] = int(job.get("ok") or 0) + 1
-                job["t_idx"] = (idx + 1) % len(targets)
-                job["sent_burst"] = int(job.get("sent_burst") or 0) + 1
-                job["last_step_ms"] = step_ms
-                job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
-                job["heal_state"] = "running"
-                job["last_error"] = ""
-                add_log(job, f"SPEED -> تنظیم: {configured_delay_ms}ms | اجرا: {step_ms}ms")
-            except Exception as e:
-                step_ms = int((time.perf_counter() - t_start) * 1000)
-                err_txt = str(e)
-                if is_kicked_error(err_txt):
-                    mark_account_kicked(acc_key, err_txt[:80])
-                    continue
-                job["fail"] = int(job.get("fail") or 0) + 1
-                job["last_step_ms"] = step_ms
-                job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
-                job["last_error"] = err_txt[:90]
-                job["t_idx"] = (idx + 1) % len(targets)
-                add_log(job, f"ERR ({step_ms}ms) -> {err_txt[:75]}")
+        try:
+            await execute_job_step(job, current_target, pre_text=chosen_text)
+            step_ms = int((time.perf_counter() - t_start) * 1000)
+            job["ok"] = int(job.get("ok") or 0) + 1
+            job["t_idx"] = (idx + 1) % len(targets)
+            job["sent_burst"] = int(job.get("sent_burst") or 0) + 1
+            job["last_step_ms"] = step_ms
+            job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
+            job["heal_state"] = "running"
+            job["last_error"] = ""
+            add_log(job, f"SPEED -> تنظیم: {configured_delay_ms}ms | اجرا: {step_ms}ms")
+            if int(job.get("ok") or 0) % 8 == 0:
+                save_jobs()
+        except Exception as e:
+            step_ms = int((time.perf_counter() - t_start) * 1000)
+            err_txt = str(e)
+            if is_kicked_error(err_txt):
+                mark_account_kicked(acc_key, err_txt[:80])
+                continue
+            record_error(f"job:{job.get('id')}", err_txt, "advance_target_and_retry")
+            job["fail"] = int(job.get("fail") or 0) + 1
+            job["last_step_ms"] = step_ms
+            job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
+            job["last_error"] = err_txt[:90]
+            job["t_idx"] = (idx + 1) % len(targets)
+            add_log(job, f"ERR ({step_ms}ms) -> {err_txt[:75]}")
 
         rest_every = int(job.get("rest_every") or 0)
         rest_ms = int(job.get("rest_ms") or 0)
@@ -1198,7 +1354,7 @@ async def poll_enemy_rules():
         for p in peers:
             try:
                 t0 = time.perf_counter()
-                msgs = await maybe_await(c.get_messages(p, limit=5), timeout=4)
+                msgs = await maybe_await(c.get_messages(p, limit=6), timeout=4)
                 if not isinstance(msgs, (list, tuple)):
                     continue
                 ordered = sorted(
@@ -1214,29 +1370,30 @@ async def poll_enemy_rules():
                         enemy_name and enemy_name in f"{uid} {uname}".lower()
                     )
                     if u_match:
-                        async with op_lock:
-                            try:
-                                next_reply = pick_next_enemy_text(er)
-                                await send_reply_message(c, [p], next_reply, mid)
-                                step_ms = int((time.perf_counter() - t0) * 1000)
-                                seen_ids.add(mid)
-                                er["replied_msg_ids"] = list(seen_ids)[-80:]
-                                er["replied_count"] = int(er.get("replied_count") or 0) + 1
-                                er["last_step_ms"] = step_ms
-                                er["last_reply_at"] = now_str()
-                                er["status"] = f"ریپلای آنی روی پیام #{mid} ({step_ms}ms)"
-                                if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
-                                    er["running"] = False
-                                    er["status"] = "تکمیل شد"
-                                save_enemies()
-                                if not er.get("running"):
-                                    break
-                            except Exception as e:
-                                er["last_error"] = str(e)[:70]
+                        try:
+                            next_reply = pick_next_enemy_text(er)
+                            await send_reply_message(c, [p], next_reply, mid)
+                            step_ms = int((time.perf_counter() - t0) * 1000)
+                            seen_ids.add(mid)
+                            er["replied_msg_ids"] = list(seen_ids)[-120:]
+                            er["replied_count"] = int(er.get("replied_count") or 0) + 1
+                            er["last_step_ms"] = step_ms
+                            er["last_reply_at"] = now_str()
+                            er["status"] = f"ریپلای آنی روی پیام #{mid} ({step_ms}ms)"
+                            if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
+                                er["running"] = False
+                                er["status"] = "تکمیل شد"
+                            save_enemies()
+                            if not er.get("running"):
+                                break
+                        except Exception as e:
+                            record_error(f"enemy:{er.get('id')}", e, "continue_polling")
+                            er["last_error"] = str(e)[:70]
             except Exception as e:
                 if is_kicked_error(e):
                     mark_account_kicked(acc_key, str(e)[:80])
                     break
+                record_error("poll_enemy", e, "next_poll_cycle")
 
 
 async def watcher_loop():
@@ -1247,11 +1404,17 @@ async def watcher_loop():
         await asyncio.sleep(0.35)
         tick += 1
         await poll_enemy_rules()
-        if tick % 12 == 0:
+        if tick % 7 == 0:
             await ensure_accounts_connected()
-        if tick % 25 == 0:
+        if tick % 16 == 0:
             for a in list(accounts):
                 await check_acc_alive(a["key"])
+        if tick % 60 == 0:
+            save_sessions()
+            save_jobs()
+            save_enemies()
+            if groups_by_acc:
+                save_groups_cache()
 
 
 async def supervisor():
@@ -1282,14 +1445,27 @@ def start_bot_thread():
     while True:
         try:
             loop.run_until_complete(async_main())
-        except Exception:
-            time.sleep(1)
+        except Exception as e:
+            record_error("bot_thread", e, "restart_asyncio_loop")
+            time.sleep(0.5)
 
 
 @app.route("/")
 @app.route("/health")
 def health():
     return "OK", 200
+
+
+@app.route("/api/recovery_info")
+def api_recovery_info():
+    rec = _read_json_with_fallback(RECOVERY_FILE, {})
+    return jsonify({
+        "ok": True,
+        "state_dir": STATE_DIR,
+        "active_acc_key": active_acc_key,
+        "recovery": rec,
+        "recent_errors": recent_errors[-20:],
+    })
 
 
 @app.route("/api/hello")
@@ -1418,8 +1594,9 @@ def api_groups():
     fut = run_async(refresh_groups(acc_key))
     if fut:
         try:
-            res = fut.result(timeout=7)
-            return jsonify(res if isinstance(res, list) else groups_by_acc.get(acc_key, []))
+            res = fut.result(timeout=8)
+            if isinstance(res, list) and res:
+                return jsonify(res)
         except Exception:
             pass
     return jsonify(groups_by_acc.get(acc_key, []))
@@ -1436,6 +1613,7 @@ def api_fetch_msg():
         try:
             return jsonify(fut.result(timeout=12))
         except Exception as e:
+            record_error("fetch_msg", e, "return_manual_fallback")
             return jsonify({"ok": False, "msg": str(e)})
     raw_chat, msg_id, clean_link = parse_splus_link(link)
     return jsonify({
@@ -1462,6 +1640,7 @@ def api_identify_user():
         try:
             return jsonify(fut.result(timeout=12))
         except Exception as e:
+            record_error("identify_user", e, "return_error_msg")
             return jsonify({"ok": False, "msg": str(e)})
     return jsonify({"ok": False, "msg": "خطا در شناسایی کاربر."})
 
@@ -1470,6 +1649,15 @@ def api_identify_user():
 def api_add_enemy():
     global enemy_seq
     acc_key = resolve_acc_key(request.args.get("acc_key") or "")
+    if not is_acc_ready(acc_key):
+        acc_obj = next((a for a in accounts if a.get("key") == acc_key), None)
+        if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+            fut = run_async(connect_single_account(acc_obj))
+            if fut:
+                try:
+                    fut.result(timeout=8)
+                except Exception:
+                    pass
     if not is_acc_ready(acc_key):
         return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست."})
 
@@ -1581,7 +1769,7 @@ def api_add_job():
     acc_label = get_acc_label(acc_key)
     speed_ms = max(40, int(request.args.get("speed_ms") or 500))
     job = {
-        "id": str(100 + job_seq),
+        "id": str(job_seq),
         "acc_key": acc_key,
         "acc_label": acc_label,
         "mode": mode,
@@ -1688,15 +1876,24 @@ def api_state():
         "groups": cur_groups,
         "jobs": jobs,
         "enemy_rules": enemy_rules,
+        "recent_errors": recent_errors[-10:],
     })
 
 
-accounts[:] = load_sessions()
-groups_by_acc.update(load_groups_cache())
-loaded_jobs = load_jobs()
-jobs[:] = loaded_jobs if isinstance(loaded_jobs, list) else []
-loaded_enemies = load_enemies()
-enemy_rules[:] = loaded_enemies if isinstance(loaded_enemies, list) else []
+try:
+    accounts[:] = load_sessions()
+    groups_by_acc.update(load_groups_cache())
+    loaded_jobs = load_jobs()
+    jobs[:] = loaded_jobs if isinstance(loaded_jobs, list) else []
+    loaded_enemies = load_enemies()
+    enemy_rules[:] = loaded_enemies if isinstance(loaded_enemies, list) else []
+    act_init = get_active_account()
+    if act_init:
+        state["phone"] = act_init.get("phone", "")
+        state["healer_status"] = "بازیابی وضعیت انجام شد؛ در حال اتصال..."
+    save_recovery_snapshot()
+except Exception as boot_err:
+    record_error("startup_recovery", boot_err, traceback.format_exc()[:120])
 
 Thread(target=start_bot_thread, daemon=True).start()
 
