@@ -1113,7 +1113,7 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
     for peer in peers:
         for kw_name in ("reply_to", "reply_to_msg_id"):
             try:
-                await maybe_await(c.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=5)
+                await maybe_await(c.send_message(peer, text_payload, **{kw_name: int(reply_to_id)}), timeout=2.5)
                 return None
             except TypeError as te:
                 last_err = te
@@ -1124,7 +1124,7 @@ async def send_reply_message(c, peer_or_list, text_payload, reply_to_id):
                     raise
                 break
         try:
-            await maybe_await(c.send_message(peer, text_payload), timeout=5)
+            await maybe_await(c.send_message(peer, text_payload), timeout=2.5)
             return None
         except Exception as e2:
             last_err = e2
@@ -1282,6 +1282,13 @@ async def run_job_worker(job):
         await asyncio.sleep(configured_delay_ms / 1000.0)
 
 
+def _active_peer_for_enemy(er):
+    cached_p = er.get("_fast_peer")
+    if cached_p is not None:
+        return [cached_p]
+    return peer_candidates(er.get("chat_id"))
+
+
 async def _poll_single_enemy(er):
     if not er.get("running"):
         return
@@ -1294,10 +1301,9 @@ async def _poll_single_enemy(er):
     if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
         er["running"] = False
         er["status"] = "تکمیل شد"
-        save_enemies()
         return
 
-    peers = peer_candidates(er.get("chat_id"))
+    peers = _active_peer_for_enemy(er)
     if not peers:
         return
 
@@ -1309,7 +1315,7 @@ async def _poll_single_enemy(er):
     for p in peers:
         try:
             t0 = time.perf_counter()
-            msgs = await maybe_await(c.get_messages(p, limit=6), timeout=3)
+            msgs = await maybe_await(c.get_messages(p, limit=2), timeout=1.5)
             if not isinstance(msgs, (list, tuple)):
                 continue
             ordered = sorted(
@@ -1319,14 +1325,16 @@ async def _poll_single_enemy(er):
             if not ordered:
                 continue
 
+            er["_fast_peer"] = p
+
             if last_seen_id == 0:
                 last_seen_id = get_msg_id_val(ordered[-1])
                 er["last_seen_msg_id"] = last_seen_id
-                continue
+                return
 
             new_msgs = [m for m in ordered if get_msg_id_val(m) > last_seen_id and get_msg_id_val(m) not in seen_ids]
             if not new_msgs:
-                continue
+                return
 
             er["last_seen_msg_id"] = max(last_seen_id, get_msg_id_val(new_msgs[-1]))
 
@@ -1342,7 +1350,7 @@ async def _poll_single_enemy(er):
                         await send_reply_message(c, [p], next_reply, mid)
                         step_ms = int((time.perf_counter() - t0) * 1000)
                         seen_ids.add(mid)
-                        er["replied_msg_ids"] = list(seen_ids)[-160:]
+                        er["replied_msg_ids"] = list(seen_ids)[-120:]
                         er["replied_count"] = int(er.get("replied_count") or 0) + 1
                         er["ok"] = er["replied_count"]
                         er["last_step_ms"] = step_ms
@@ -1351,17 +1359,18 @@ async def _poll_single_enemy(er):
                         if max_c > 0 and int(er.get("replied_count") or 0) >= max_c:
                             er["running"] = False
                             er["status"] = "تکمیل شد"
-                        save_enemies()
-                        if not er.get("running"):
-                            break
+                            save_enemies()
+                            return
                     except Exception as e:
                         er["fail"] = int(er.get("fail") or 0) + 1
                         er["last_error"] = str(e)[:70]
-            break
+            return
         except Exception as e:
             if is_kicked_error(e):
                 mark_account_kicked(acc_key, str(e)[:80])
-                break
+                return
+            if er.get("_fast_peer") is not None:
+                er["_fast_peer"] = None
 
 
 async def poll_enemy_rules():
@@ -1377,7 +1386,7 @@ async def enemy_fast_loop():
             await poll_enemy_rules()
         except Exception:
             pass
-        await asyncio.sleep(0.06)
+        await asyncio.sleep(0.015)
 
 
 async def watcher_loop():
@@ -1386,14 +1395,14 @@ async def watcher_loop():
     asyncio.create_task(enemy_fast_loop())
 
     while True:
-        await asyncio.sleep(0.45)
+        await asyncio.sleep(0.5)
         tick += 1
-        if tick % 7 == 0:
+        if tick % 8 == 0:
             await ensure_accounts_connected()
-        if tick % 16 == 0:
+        if tick % 20 == 0:
             for a in list(accounts):
                 await check_acc_alive(a["key"])
-        if tick % 80 == 0:
+        if tick % 40 == 0:
             save_sessions()
             save_jobs()
             save_enemies()
@@ -1670,8 +1679,9 @@ def api_add_enemy():
         "last_seen_msg_id": 0,
         "last_reply_at": "-",
         "last_error": "",
-        "status": "آماده ریپلای سریع در همین چت",
+        "status": "آماده ریپلای آنی در همین چت",
         "running": True,
+        "_fast_peer": None,
     }
     enemy_rules.append(er)
     save_enemies()
@@ -1696,7 +1706,8 @@ def api_enemy_ctrl():
                         return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان قابل اجراست."})
                 er["running"] = not er.get("running", False)
                 er["last_seen_msg_id"] = 0
-                er["status"] = "آماده ریپلای سریع در همین چت" if er["running"] else "متوقف"
+                er["_fast_peer"] = None
+                er["status"] = "آماده ریپلای آنی در همین چت" if er["running"] else "متوقف"
             elif act == "delete":
                 enemy_rules.remove(er)
             break
@@ -1841,6 +1852,15 @@ def api_state():
         for a in accounts
     ]
 
+    jobs_clean = [
+        {k: v for k, v in j.items() if not str(k).startswith("_")}
+        for j in jobs
+    ]
+    enemies_clean = [
+        {k: v for k, v in er.items() if not str(k).startswith("_")}
+        for er in enemy_rules
+    ]
+
     return jsonify({
         "ping": state["ping"],
         "cpu": state["cpu"],
@@ -1854,8 +1874,8 @@ def api_state():
         "active_acc_key": cur_key,
         "accounts": acc_list_out,
         "groups": cur_groups,
-        "jobs": jobs,
-        "enemy_rules": enemy_rules,
+        "jobs": jobs_clean,
+        "enemy_rules": enemies_clean,
     })
 
 
