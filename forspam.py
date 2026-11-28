@@ -51,7 +51,6 @@ SESSIONS_FILE = _state_path("soroush_sessions.json")
 JOBS_FILE = _state_path("fonex_jobs.json")
 GROUPS_CACHE_FILE = _state_path("fonex_groups_cache.json")
 
-# سقف بالا برای جلوگیری از پر شدن و بلاک شدن تسک‌ها
 MAX_TOTAL_ACTIVE = 100
 MAX_TARGETS_PER_JOB = 10
 
@@ -85,7 +84,7 @@ state = {
     "ram": "0",
     "auth_msg": "آماده ورود شماره",
     "phone": "",
-    "healer_status": "پایدار و روشن ۲۴/۷",
+    "healer_status": "متصل مستقل روی سرور",
     "soroush_connected": False,
     "kicked_out": False,
     "event_notice": "",
@@ -298,13 +297,13 @@ def load_jobs():
             j.setdefault("speed_ms", 1000)
             j.setdefault("last_step_ms", 0)
             j.setdefault("effective_delay_ms", int(j.get("speed_ms") or 1000))
-            j.setdefault("heal_state", "running-steady" if j.get("running") else "paused")
+            j.setdefault("heal_state", "running-server" if j.get("running") else "paused")
             j.setdefault("last_error", "")
             j.setdefault("ok", 0)
             j.setdefault("fail", 0)
             j.setdefault("logs", [])
             if j.get("running"):
-                add_log(j, "STEADY-RESTORE -> ادامه پیوسته بدون وقفه")
+                add_log(j, "SERVER-RESUME -> ادامه مستقیم روی سرور")
             cleaned.append(j)
     job_seq = max(max_num, 100 + len(cleaned))
     return cleaned
@@ -650,10 +649,10 @@ async def connect_single_account(acc_obj, force_new=False):
                 state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
                 state["kicked_out"] = False
                 state["soroush_connected"] = bool(sess)
-                state["healer_status"] = "متصل پایدار ۲۴/۷" if sess else "در انتظار ورود"
+                state["healer_status"] = "متصل مستقل روی سرور" if sess else "در انتظار ورود"
             if sess:
                 save_sessions()
-                emit_soroush_event(f"سروش به پنل متصل شد ({acc_obj.get('name') or acc_key})")
+                emit_soroush_event(f"سروش مستقیم به سرور وصل شد ({acc_obj.get('name') or acc_key})")
                 if not groups_by_acc.get(acc_key):
                     asyncio.create_task(refresh_groups(acc_key, force_alive=False))
             return True
@@ -676,7 +675,7 @@ async def ensure_accounts_connected():
             if ok:
                 connected_any = True
     if connected_any:
-        emit_soroush_event("اتصال سروش برقرار شد و اطلاعات بروز شد")
+        emit_soroush_event("اتصال مستقیم سرور به سروش برقرار شد")
 
 
 async def check_acc_alive(acc_key):
@@ -701,7 +700,7 @@ async def check_acc_alive(acc_key):
             if acc_key == active_acc_key:
                 state["kicked_out"] = False
                 state["soroush_connected"] = True
-                state["healer_status"] = "متصل پایدار ۲۴/۷"
+                state["healer_status"] = "متصل مستقل روی سرور"
         return True
     except Exception as e:
         if is_kicked_error(e):
@@ -720,7 +719,7 @@ async def do_send_code(phone):
     active_acc_key = acc_key
     state["phone"] = phone
     state["kicked_out"] = False
-    state["auth_msg"] = "در حال ارسال کد..."
+    state["auth_msg"] = "در حال ارسال کد از طریق سرور..."
 
     if not any(a.get("key") == acc_key for a in accounts):
         accounts.append({
@@ -784,7 +783,7 @@ async def do_send_code(phone):
                 "phone": phone,
                 "phone_code_hash": code_hash,
             }
-            state["auth_msg"] = f"کد برای {phone} ارسال شد؛ کد را وارد کنید."
+            state["auth_msg"] = f"کد برای {phone} از طریق سرور ارسال شد؛ کد را وارد کنید."
             return
         except Exception as e:
             last_err = e
@@ -802,7 +801,7 @@ async def do_verify_code(code):
     pend = pending_auth_by_acc.get(acc_key) or {}
     phone = pend.get("phone") or state.get("phone", "").strip()
     phone_code_hash = pend.get("phone_code_hash")
-    state["auth_msg"] = "در حال تأیید کد..."
+    state["auth_msg"] = "در حال تأیید کد روی سرور..."
 
     try:
         c = get_acc_client(acc_key)
@@ -875,9 +874,9 @@ async def do_verify_code(code):
         save_sessions()
         state["kicked_out"] = False
         state["soroush_connected"] = True
-        state["healer_status"] = "متصل پایدار ۲۴/۷"
-        state["auth_msg"] = f"اکانت {name} متصل شد."
-        emit_soroush_event(f"اکانت {name} به سروش وصل شد")
+        state["healer_status"] = "متصل مستقل روی سرور"
+        state["auth_msg"] = f"اکانت {name} مستقیم به سرور متصل شد."
+        emit_soroush_event(f"اکانت {name} به سرور وصل شد")
         try:
             await refresh_groups(acc_key, force_alive=False)
         except Exception:
@@ -1031,7 +1030,7 @@ async def execute_job_step(job, raw_target, pre_text=None):
             await connect_single_account(acc_obj)
             c = get_acc_client(acc_key)
     if not is_acc_ready(acc_key) or c is None:
-        raise RuntimeError("در حال اتصال مجدد پایدار...")
+        raise RuntimeError("در حال اتصال مجدد مستقیم روی سرور...")
 
     mode = job.get("mode") or "spam"
     payload = str(pre_text if pre_text is not None else (job.get("payload") or ""))
@@ -1044,7 +1043,7 @@ async def execute_job_step(job, raw_target, pre_text=None):
         if reply_msg_id <= 0:
             raise ValueError("شناسه پیام برای ریپلای معتبر نیست.")
         await send_reply_message(c, dst_cands, payload, reply_msg_id)
-        add_log(job, f"REPLY OK -> {clean_target(raw_target)} (#{reply_msg_id})")
+        add_log(job, f"SERVER REPLY OK -> {clean_target(raw_target)} (#{reply_msg_id})")
         return
 
     if mode == "forward":
@@ -1067,7 +1066,7 @@ async def execute_job_step(job, raw_target, pre_text=None):
                             try:
                                 await maybe_await(call_fn(), timeout=8)
                                 sent_ok = True
-                                add_log(job, f"FWD OK -> {clean_target(raw_target)} (#{msg_id})")
+                                add_log(job, f"SERVER FWD OK -> {clean_target(raw_target)} (#{msg_id})")
                                 break
                             except TypeError:
                                 continue
@@ -1087,7 +1086,7 @@ async def execute_job_step(job, raw_target, pre_text=None):
                 try:
                     await maybe_await(c.send_message(dst_p, payload), timeout=8)
                     sent_ok = True
-                    add_log(job, f"FWD/MSG OK -> {clean_target(raw_target)} (#{msg_id})")
+                    add_log(job, f"SERVER FWD/MSG OK -> {clean_target(raw_target)} (#{msg_id})")
                     break
                 except Exception as e:
                     last_err = e
@@ -1102,7 +1101,7 @@ async def execute_job_step(job, raw_target, pre_text=None):
     for peer in dst_cands:
         try:
             await maybe_await(c.send_message(peer, payload), timeout=8)
-            add_log(job, f"SPAM OK -> {clean_target(raw_target)}")
+            add_log(job, f"SERVER SPAM OK -> {clean_target(raw_target)}")
             return
         except Exception as e:
             last_err = e
@@ -1127,8 +1126,8 @@ async def run_job_worker(job):
             if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
                 await connect_single_account(acc_obj)
             if not is_acc_ready(acc_key):
-                job["heal_state"] = "reconnecting-steady"
-                job["last_error"] = "تلاش خودکار برای حفظ اتصال..."
+                job["heal_state"] = "reconnecting-server"
+                job["last_error"] = "تلاش خودکار سرور برای حفظ اتصال..."
                 await asyncio.sleep(0.4)
                 continue
 
@@ -1159,9 +1158,9 @@ async def run_job_worker(job):
             job["sent_burst"] = int(job.get("sent_burst") or 0) + 1
             job["last_step_ms"] = step_ms
             job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
-            job["heal_state"] = f"steady ({configured_delay_ms}ms)"
+            job["heal_state"] = f"server-steady ({configured_delay_ms}ms)"
             job["last_error"] = ""
-            if int(job.get("ok") or 0) % 15 == 0:
+            if int(job.get("ok") or 0) % 10 == 0:
                 save_jobs()
         except Exception as e:
             step_ms = int((time.perf_counter() - t_start) * 1000)
@@ -1195,7 +1194,7 @@ async def watcher_loop():
             if tick % 18 == 0:
                 for a in list(accounts):
                     await check_acc_alive(a["key"])
-            if tick % 40 == 0:
+            if tick % 30 == 0:
                 save_sessions()
                 save_jobs()
                 if groups_by_acc:
@@ -1422,7 +1421,7 @@ def api_add_job():
                 except Exception:
                     pass
     if not is_acc_ready(acc_key):
-        return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست؛ کمی صبر کن و دوباره بزن."})
+        return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده به سرور متصل نیست؛ کمی صبر کن و دوباره بزن."})
 
     mode = (request.args.get("mode") or "spam").strip().lower()
     if mode not in ("spam", "forward", "reply"):
@@ -1485,16 +1484,16 @@ def api_add_job():
         "effective_delay_ms": speed_ms,
         "max_count": max(0, int(request.args.get("max_count") or 0)),
         "running": True,
-        "heal_state": f"steady ({speed_ms}ms)",
+        "heal_state": f"server-steady ({speed_ms}ms)",
         "last_error": "",
         "ok": 0,
         "fail": 0,
-        "logs": [f"[{now_str()}] steady-started ({mode}) on {acc_label} | speed={speed_ms}ms"],
+        "logs": [f"[{now_str()}] registered on server ({mode}) for {acc_label} | speed={speed_ms}ms"],
     }
     jobs.append(job)
     save_jobs()
-    emit_soroush_event(f"تسک #{job['id']} شروع شد")
-    return jsonify({"ok": True, "msg": f"تسک {mode} #{job['id']} روی اکانت {acc_label} به‌صورت پایدار شروع شد."})
+    emit_soroush_event(f"تسک #{job['id']} روی سرور ثبت و شروع شد")
+    return jsonify({"ok": True, "msg": f"تسک {mode} #{job['id']} روی سرور ثبت شد و مستقیم از سرور ارسال می‌شود."})
 
 
 @app.route("/api/job_ctrl")
@@ -1517,12 +1516,12 @@ def api_job_ctrl():
                                     pass
                 j["running"] = not j.get("running", False)
                 spd = int(j.get("speed_ms") or 1000)
-                j["heal_state"] = f"steady ({spd}ms)" if j["running"] else "paused"
+                j["heal_state"] = f"server-steady ({spd}ms)" if j["running"] else "paused"
             elif act == "delete":
                 jobs.remove(j)
             break
     save_jobs()
-    emit_soroush_event("لیست تسک‌ها بروز شد")
+    emit_soroush_event("لیست تسک‌های سرور بروز شد")
     return jsonify({"ok": True})
 
 
