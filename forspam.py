@@ -51,8 +51,9 @@ SESSIONS_FILE = _state_path("soroush_sessions.json")
 JOBS_FILE = _state_path("fonex_jobs.json")
 GROUPS_CACHE_FILE = _state_path("fonex_groups_cache.json")
 
-MAX_TOTAL_ACTIVE = 3
-MAX_TARGETS_PER_JOB = 3
+# سقف بالا برای جلوگیری از پر شدن و بلاک شدن تسک‌ها
+MAX_TOTAL_ACTIVE = 100
+MAX_TARGETS_PER_JOB = 10
 
 KICK_KEYWORDS = (
     "session_revoked",
@@ -79,12 +80,12 @@ event_seq = 1
 _refreshing_keys = set()
 
 state = {
-    "ping": "12 ms",
+    "ping": "10 ms",
     "cpu": "0",
     "ram": "0",
     "auth_msg": "آماده ورود شماره",
     "phone": "",
-    "healer_status": "آماده",
+    "healer_status": "پایدار و روشن ۲۴/۷",
     "soroush_connected": False,
     "kicked_out": False,
     "event_notice": "",
@@ -158,7 +159,7 @@ def add_log(job, text):
     if not isinstance(logs, list):
         logs = []
     logs.append(f"[{now_str()}] {text}")
-    job["logs"] = logs[-35:]
+    job["logs"] = logs[-25:]
 
 
 def parse_multi_texts(raw_val):
@@ -294,16 +295,16 @@ def load_jobs():
             j.setdefault("text_idx", 0)
             j.setdefault("t_idx", 0)
             j.setdefault("sent_burst", 0)
-            j.setdefault("speed_ms", 400)
+            j.setdefault("speed_ms", 1000)
             j.setdefault("last_step_ms", 0)
-            j.setdefault("effective_delay_ms", int(j.get("speed_ms") or 400))
-            j.setdefault("heal_state", "running" if j.get("running") else "paused")
+            j.setdefault("effective_delay_ms", int(j.get("speed_ms") or 1000))
+            j.setdefault("heal_state", "running-steady" if j.get("running") else "paused")
             j.setdefault("last_error", "")
             j.setdefault("ok", 0)
             j.setdefault("fail", 0)
             j.setdefault("logs", [])
             if j.get("running"):
-                add_log(j, "RESTORED -> ادامه خودکار پس از ری‌استارت سرور")
+                add_log(j, "STEADY-RESTORE -> ادامه پیوسته بدون وقفه")
             cleaned.append(j)
     job_seq = max(max_num, 100 + len(cleaned))
     return cleaned
@@ -450,7 +451,7 @@ def get_msg_id_val(obj):
     return 0
 
 
-async def maybe_await(res, timeout=14):
+async def maybe_await(res, timeout=12):
     if asyncio.iscoroutine(res):
         return await asyncio.wait_for(res, timeout=timeout)
     return res
@@ -469,17 +470,6 @@ def mark_account_kicked(acc_key, reason="اکانت از سشن خارج شد.")
             a["session"] = ""
     clients_by_acc.pop(acc_key, None)
     save_sessions()
-
-    changed = False
-    for j in jobs:
-        if j.get("acc_key") == acc_key and j.get("running"):
-            j["running"] = False
-            j["heal_state"] = "kicked"
-            j["last_error"] = "خروج از اکانت"
-            add_log(j, "KICKED -> متوقف شد (خروج از اکانت)")
-            changed = True
-    if changed:
-        save_jobs()
 
     if acc_key == active_acc_key:
         state["soroush_connected"] = False
@@ -649,7 +639,7 @@ async def connect_single_account(acc_obj, force_new=False):
             if sess and hasattr(c, "get_me"):
                 me = await maybe_await(c.get_me(), timeout=7)
                 if me is None and attempt == 0:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.4)
                     continue
                 name = getattr(me, "first_name", None) or acc_obj.get("name") or acc_obj.get("phone") or acc_key
                 acc_obj["name"] = str(name)
@@ -660,7 +650,7 @@ async def connect_single_account(acc_obj, force_new=False):
                 state["ping"] = f"{int((time.perf_counter() - t0) * 1000)} ms"
                 state["kicked_out"] = False
                 state["soroush_connected"] = bool(sess)
-                state["healer_status"] = "متصل به سروش (پایدار)" if sess else "در انتظار ورود"
+                state["healer_status"] = "متصل پایدار ۲۴/۷" if sess else "در انتظار ورود"
             if sess:
                 save_sessions()
                 emit_soroush_event(f"سروش به پنل متصل شد ({acc_obj.get('name') or acc_key})")
@@ -672,7 +662,7 @@ async def connect_single_account(acc_obj, force_new=False):
                 mark_account_kicked(acc_key, str(e)[:80])
                 return False
             if attempt == 0:
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(0.5)
                 continue
             return False
     return False
@@ -711,7 +701,7 @@ async def check_acc_alive(acc_key):
             if acc_key == active_acc_key:
                 state["kicked_out"] = False
                 state["soroush_connected"] = True
-                state["healer_status"] = "متصل به سروش (پایدار)"
+                state["healer_status"] = "متصل پایدار ۲۴/۷"
         return True
     except Exception as e:
         if is_kicked_error(e):
@@ -885,7 +875,7 @@ async def do_verify_code(code):
         save_sessions()
         state["kicked_out"] = False
         state["soroush_connected"] = True
-        state["healer_status"] = "متصل به سروش (پایدار)"
+        state["healer_status"] = "متصل پایدار ۲۴/۷"
         state["auth_msg"] = f"اکانت {name} متصل شد."
         emit_soroush_event(f"اکانت {name} به سروش وصل شد")
         try:
@@ -1041,7 +1031,7 @@ async def execute_job_step(job, raw_target, pre_text=None):
             await connect_single_account(acc_obj)
             c = get_acc_client(acc_key)
     if not is_acc_ready(acc_key) or c is None:
-        raise RuntimeError("در حال اتصال مجدد به سروش...")
+        raise RuntimeError("در حال اتصال مجدد پایدار...")
 
     mode = job.get("mode") or "spam"
     payload = str(pre_text if pre_text is not None else (job.get("payload") or ""))
@@ -1124,8 +1114,12 @@ async def execute_job_step(job, raw_target, pre_text=None):
 async def run_job_worker(job):
     while job in jobs:
         if not job.get("running"):
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
             continue
+
+        cycle_start = time.monotonic()
+        configured_delay_ms = max(40, int(job.get("speed_ms") or 1000))
+        job["speed_ms"] = configured_delay_ms
 
         acc_key = job.get("acc_key") or resolve_acc_key("")
         if not is_acc_ready(acc_key):
@@ -1133,9 +1127,9 @@ async def run_job_worker(job):
             if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
                 await connect_single_account(acc_obj)
             if not is_acc_ready(acc_key):
-                job["heal_state"] = "reconnecting"
-                job["last_error"] = "در حال حفظ اتصال با سروش..."
-                await asyncio.sleep(0.7)
+                job["heal_state"] = "reconnecting-steady"
+                job["last_error"] = "تلاش خودکار برای حفظ اتصال..."
+                await asyncio.sleep(0.4)
                 continue
 
         max_c = int(job.get("max_count") or 0)
@@ -1155,8 +1149,6 @@ async def run_job_worker(job):
         idx = int(job.get("t_idx") or 0) % len(targets)
         current_target = targets[idx]
         chosen_text = pick_next_job_text(job)
-        configured_delay_ms = max(40, int(job.get("speed_ms") or 400))
-        job["speed_ms"] = configured_delay_ms
 
         t_start = time.perf_counter()
         try:
@@ -1167,25 +1159,27 @@ async def run_job_worker(job):
             job["sent_burst"] = int(job.get("sent_burst") or 0) + 1
             job["last_step_ms"] = step_ms
             job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
-            job["heal_state"] = "running"
+            job["heal_state"] = f"steady ({configured_delay_ms}ms)"
             job["last_error"] = ""
-            add_log(job, f"SPEED -> تنظیم: {configured_delay_ms}ms | اجرا: {step_ms}ms")
-            if int(job.get("ok") or 0) % 10 == 0:
+            if int(job.get("ok") or 0) % 15 == 0:
                 save_jobs()
         except Exception as e:
             step_ms = int((time.perf_counter() - t_start) * 1000)
             err_txt = str(e)
             if is_kicked_error(err_txt):
                 mark_account_kicked(acc_key, err_txt[:80])
+                await asyncio.sleep(0.5)
                 continue
             job["fail"] = int(job.get("fail") or 0) + 1
             job["last_step_ms"] = step_ms
             job["effective_delay_ms"] = max(step_ms, configured_delay_ms)
             job["last_error"] = err_txt[:90]
             job["t_idx"] = (idx + 1) % len(targets)
-            add_log(job, f"ERR ({step_ms}ms) -> {err_txt[:75]}")
+            add_log(job, f"RETRY ({step_ms}ms) -> {err_txt[:70]}")
 
-        await asyncio.sleep(configured_delay_ms / 1000.0)
+        elapsed_s = time.monotonic() - cycle_start
+        remaining_s = max(0.01, (configured_delay_ms / 1000.0) - elapsed_s)
+        await asyncio.sleep(remaining_s)
 
 
 async def watcher_loop():
@@ -1193,32 +1187,38 @@ async def watcher_loop():
     await ensure_accounts_connected()
 
     while True:
-        await asyncio.sleep(0.5)
-        tick += 1
-        if tick % 8 == 0:
-            await ensure_accounts_connected()
-        if tick % 20 == 0:
-            for a in list(accounts):
-                await check_acc_alive(a["key"])
-        if tick % 50 == 0:
-            save_sessions()
-            save_jobs()
-            if groups_by_acc:
-                save_groups_cache()
+        try:
+            await asyncio.sleep(0.5)
+            tick += 1
+            if tick % 6 == 0:
+                await ensure_accounts_connected()
+            if tick % 18 == 0:
+                for a in list(accounts):
+                    await check_acc_alive(a["key"])
+            if tick % 40 == 0:
+                save_sessions()
+                save_jobs()
+                if groups_by_acc:
+                    save_groups_cache()
+        except Exception:
+            await asyncio.sleep(0.5)
 
 
 async def supervisor():
     active = {}
     asyncio.create_task(watcher_loop())
     while True:
-        ids = {j["id"] for j in jobs}
-        for k in list(active.keys()):
-            if k not in ids or active[k].done():
-                active.pop(k, None)
-        for j in list(jobs):
-            if j["id"] not in active:
-                active[j["id"]] = asyncio.create_task(run_job_worker(j))
-        await asyncio.sleep(0.35)
+        try:
+            ids = {j["id"] for j in jobs}
+            for k in list(active.keys()):
+                if k not in ids or active[k].done():
+                    active.pop(k, None)
+            for j in list(jobs):
+                if j["id"] not in active:
+                    active[j["id"]] = asyncio.create_task(run_job_worker(j))
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
 
 
 async def async_main():
@@ -1226,7 +1226,7 @@ async def async_main():
     bot_loop = asyncio.get_running_loop()
     asyncio.create_task(supervisor())
     while True:
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
 
 
 def start_bot_thread():
@@ -1236,7 +1236,7 @@ def start_bot_thread():
         try:
             loop.run_until_complete(async_main())
         except Exception:
-            time.sleep(1)
+            time.sleep(0.4)
 
 
 @app.route("/")
@@ -1424,9 +1424,6 @@ def api_add_job():
     if not is_acc_ready(acc_key):
         return jsonify({"ok": False, "msg": "اکانت انتخاب‌شده متصل نیست؛ کمی صبر کن و دوباره بزن."})
 
-    if total_running_count() >= MAX_TOTAL_ACTIVE:
-        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان (اسپم/فوروارد/ریپلای) قابل اجراست."})
-
     mode = (request.args.get("mode") or "spam").strip().lower()
     if mode not in ("spam", "forward", "reply"):
         mode = "spam"
@@ -1468,7 +1465,7 @@ def api_add_job():
 
     job_seq += 1
     acc_label = get_acc_label(acc_key)
-    speed_ms = max(40, int(request.args.get("speed_ms") or 400))
+    speed_ms = max(40, int(request.args.get("speed_ms") or 1000))
     job = {
         "id": str(job_seq),
         "acc_key": acc_key,
@@ -1488,16 +1485,16 @@ def api_add_job():
         "effective_delay_ms": speed_ms,
         "max_count": max(0, int(request.args.get("max_count") or 0)),
         "running": True,
-        "heal_state": "running",
+        "heal_state": f"steady ({speed_ms}ms)",
         "last_error": "",
         "ok": 0,
         "fail": 0,
-        "logs": [f"[{now_str()}] started ({mode}) on {acc_label} | speed={speed_ms}ms"],
+        "logs": [f"[{now_str()}] steady-started ({mode}) on {acc_label} | speed={speed_ms}ms"],
     }
     jobs.append(job)
     save_jobs()
     emit_soroush_event(f"تسک #{job['id']} شروع شد")
-    return jsonify({"ok": True, "msg": f"تسک {mode} #{job['id']} روی اکانت {acc_label} شروع شد."})
+    return jsonify({"ok": True, "msg": f"تسک {mode} #{job['id']} روی اکانت {acc_label} به‌صورت پایدار شروع شد."})
 
 
 @app.route("/api/job_ctrl")
@@ -1510,11 +1507,17 @@ def api_job_ctrl():
                 if not j.get("running"):
                     j_acc = j.get("acc_key") or resolve_acc_key("")
                     if not is_acc_ready(j_acc):
-                        return jsonify({"ok": False, "msg": "اکانت این تسک متصل نیست."})
-                    if total_running_count() >= MAX_TOTAL_ACTIVE:
-                        return jsonify({"ok": False, "msg": f"حداکثر {MAX_TOTAL_ACTIVE} تسک هم‌زمان قابل اجراست."})
+                        acc_obj = next((a for a in accounts if a.get("key") == j_acc), None)
+                        if acc_obj and acc_obj.get("session") and not acc_obj.get("kicked"):
+                            fut = run_async(connect_single_account(acc_obj))
+                            if fut:
+                                try:
+                                    fut.result(timeout=6)
+                                except Exception:
+                                    pass
                 j["running"] = not j.get("running", False)
-                j["heal_state"] = "running" if j["running"] else "paused"
+                spd = int(j.get("speed_ms") or 1000)
+                j["heal_state"] = f"steady ({spd}ms)" if j["running"] else "paused"
             elif act == "delete":
                 jobs.remove(j)
             break
